@@ -616,6 +616,12 @@ impl Engine {
         self.lexicon.load_custom(path)
     }
 
+    /// 输入正好是某个自定义编码（mail、wdyx）。这种编码要跟整段输入精确对上，
+    /// 会话把它拼成连续输入重放的话就查不到了，那种情况直接走原来的解码。
+    pub fn has_custom_code(&self, raw: &str) -> bool {
+        !self.lexicon.custom_code_words(raw.trim()).is_empty()
+    }
+
     pub fn lm(&self) -> &Arc<dyn LanguageModel> {
         &self.lm
     }

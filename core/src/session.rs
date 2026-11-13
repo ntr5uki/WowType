@@ -11,8 +11,8 @@
 //!   编辑区的分音节显示（`nihao` 显示成 `ni hao`，双拼显示成全拼）。
 //!
 //! - 选词（句首词进已选栈，整句上屏）和学习（选词记录、分几次选出来的整句也记一次）；
-//! - 前缀链：上屏过的词和拼音记在会话里，第 2 步重放成「拼音前缀 + 当前输入」用
-//!   （分段输入的候选排序要和一口气打一样）；现在只记不读。
+//! - 前缀链：上屏过的词和拼音记在会话里，算候选时重放成「拼音前缀 + 当前输入」，
+//!   排序和一口气打一样，候选里的前缀文字再剥掉（分段输入和连续输入结果一致）。
 //! - 空格、回车、数字、分号引号选词、计算器和双拼分号进编辑区，翻页、移光标和
 //!   横排下键展开的候选面板（页和光标照 fcitx5 的候选列表：各管各的，光标可以不在这一页上）。
 //!
@@ -190,7 +190,7 @@ pub struct Selection {
 
 /// 前缀链里的一条：上屏过的一个词（或整句）和它的拼音。
 ///
-/// 前缀链是「已经上屏、还能拼回拼音」的那一段，第 2 步拿它重放成「拼音前缀 + 当前输入」，
+/// 前缀链是「已经上屏、还能拼回拼音」的那一段，算候选时拿它重放成「拼音前缀 + 当前输入」，
 /// 让分段输入的候选排序和一口气打一样（见设计文档「上下文断链」：链上只有追加和清空）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Committed {
@@ -374,8 +374,9 @@ pub struct Session<'e> {
     config: Config,
     /// 光标前已经上屏的字（外壳记的）。
     context: String,
-    /// 前缀链：上屏过的词和拼音，第 2 步重放成连续输入用。只有「追加」和「清空」，
-    /// 没有拼音的上屏（标点、数字、计算器、emoji、回车上的原始字母）清空整条。
+    /// 前缀链：上屏过的词和拼音，算候选时重放进解码（[`Session::replay_candidates`]）。
+    /// 只有「追加」和「清空」，没有拼音的上屏（标点、数字、计算器、emoji、回车上的原始字母）
+    /// 清空整条。
     prefix: Vec<Committed>,
     clock: Clock,
     /// 候选缓存：输入、已选词、引擎、上文、设置变了就作废，用的时候再算。
@@ -477,12 +478,16 @@ impl<'e> Session<'e> {
         }
     }
 
-    /// 前缀链：已经上屏、还拼得出拼音的那些词（第 2 步重放用）。
+    /// 前缀链：已经上屏、还拼得出拼音的那些词（重放用）。
     pub fn prefix(&self) -> &[Committed] {
         &self.prefix
     }
 
-    /// 清空前缀链（换输入框、光标被挪走、应用侧删字；第 2 步接上外壳的这些信号）。
+    /// 清空前缀链（换输入框、光标被挪走、应用侧删字；第 3 步接上外壳的这些信号）。
+    ///
+    /// 不要放进 `reset()`：外壳上完屏也会调一次 `_reset(0)`（fcitx5 的 `state->clear()`），
+    /// 那样每次选词都会把链清掉，重放永远不会生效。第 3 步给它单独的 C 接口，让外壳在真正
+    /// 断了上下文的地方（`WowtypeEngine::reset`、Esc、方向键、预编辑为空时的退格、`commitPlain`）调。
     pub fn clear_prefix(&mut self) {
         self.prefix.clear();
     }
@@ -1069,41 +1074,89 @@ impl<'e> Session<'e> {
         // 已经选了开头的词时，把它当上文，剩下的部分排序更准
         let context = self.context.clone() + &self.selected_text();
         engine.set_context(utf8_tail(&context, CONTEXT_BYTES));
+        // 前面还上屏过别的词：把「前缀 + 这段输入」当成一条连续输入重新解码，
+        // 候选和一口气打一样（重放不了就照原路径解码）
+        if let Some(all) = self.replay_candidates(engine, input) {
+            return all;
+        }
         let Ok(found) = engine.try_input(input) else {
             return Vec::new();
         };
         let mut all: Vec<Candidate> = found
             .into_iter()
-            .map(|c| {
-                let consumed = if c.consumed == 0 || c.consumed > input.len() {
-                    input.len()
-                } else {
-                    c.consumed
-                };
-                // 自定义词里带换行的，不往用户词库里记（词库是一行一条）
-                let kind = if c.text.contains(['\n', '\t']) {
-                    CandidateKind::Plain
-                } else {
-                    CandidateKind::Word
-                };
-                Candidate {
-                    commit: c.text.clone(),
-                    text: c.text,
-                    pinyin: c.pinyin,
-                    consumed,
-                    kind,
-                    emoji: String::new(),
-                }
-            })
+            .map(|c| word_candidate(c.text, c.pinyin, c.consumed, input.len()))
             .collect();
+        self.add_extras(&mut all, input, engine.config().shuangpin);
+        all
+    }
+
+    /// 前缀链上的词和现在打的这段拼成一条连续输入重新解码，再把前缀那段文字和拼音剥掉，
+    /// 剩下的 `text` / `pinyin` / `consumed` 都和没重放时一样是相对这段输入的。
+    ///
+    /// 下面这些情况回退（None，照原来的路径解码）：
+    ///
+    /// - 链是空的；
+    /// - 双拼：链上存的是全拼音节，引擎要的是双拼键，没有反向的编码器；
+    /// - 输入正好是个自定义编码（mail、wdyx）：编码要跟整段输入精确对得上，重放以后就对不上了；
+    /// - 剥完一个候选都不剩（解析失败、原始串候选、自定义词都拼不进前缀）。
+    fn replay_candidates(&self, engine: &Engine, input: &str) -> Option<Vec<Candidate>> {
+        if self.prefix.is_empty() || engine.config().shuangpin || engine.has_custom_code(input) {
+            return None;
+        }
+        let syllables: Vec<&str> = self
+            .prefix
+            .iter()
+            .flat_map(|c| c.pinyin.split_whitespace())
+            .collect();
+        if syllables.is_empty() {
+            return None;
+        }
+        let prefix_text: String = self.prefix.iter().map(|c| c.text.as_str()).collect();
+        // 重放串就是「一口气打完」的样子：音节之间不留空格
+        let prefix_pinyin: String = syllables.concat();
+        let prefix_bytes = prefix_pinyin.len();
+        let replay = prefix_pinyin + input;
+        let found = engine.try_input(&replay).ok()?;
+        let mut all: Vec<Candidate> = Vec::new();
+        for c in found {
+            // 前缀那几个字得原样是这条候选的开头
+            let Some(rest) = c.text.strip_prefix(&prefix_text) else {
+                continue;
+            };
+            // 拼音也要对得上：引擎切出来的前几个音节和链上的一样，多出来的才是这段输入的
+            let pinyin: Vec<&str> = c.pinyin.split_whitespace().collect();
+            if pinyin.len() <= syllables.len() || pinyin[..syllables.len()] != syllables[..] {
+                continue;
+            }
+            // 换算回相对这段输入的字节数：不够前缀（只解出前缀本身）、落在半个字上就丢
+            let consumed = c.consumed.saturating_sub(prefix_bytes);
+            if rest.is_empty() || consumed == 0 || !input.is_char_boundary(consumed) {
+                continue;
+            }
+            all.push(word_candidate(
+                rest.to_owned(),
+                pinyin[syllables.len()..].join(" "),
+                consumed,
+                input.len(),
+            ));
+        }
+        if all.is_empty() {
+            return None;
+        }
+        // 重放只在全拼下走，所以附加候选按全拼算
+        self.add_extras(&mut all, input, false);
+        Some(all)
+    }
+
+    /// emoji 推荐、按键 emoji、日期时间：都是相对这段输入的附加候选。
+    fn add_extras(&self, all: &mut Vec<Candidate>, input: &str, shuangpin: bool) {
         if self.config.emoji_suggest {
-            add_emoji_suggestion(&mut all, input.len());
-            add_keycap(&mut all, input.len(), self.config.page_size);
+            add_emoji_suggestion(all, input.len());
+            add_keycap(all, input.len(), self.config.page_size);
         }
         if self.config.date_time && self.selections.is_empty() {
-            self.add_date_time(&mut all, input, engine.config().shuangpin);
+            self.add_date_time(all, input, shuangpin);
         }
-        all
     }
 
     /// 日期时间：首选还是那个词（日期、时间），各种写法从第二个开始。
@@ -1387,6 +1440,29 @@ impl<'e> Session<'e> {
     }
 }
 
+/// 引擎的一条候选换成会话的候选：用掉的字节夹在输入长度里，带换行的自定义词不学习。
+fn word_candidate(text: String, pinyin: String, consumed: usize, input_len: usize) -> Candidate {
+    let consumed = if consumed == 0 || consumed > input_len {
+        input_len
+    } else {
+        consumed
+    };
+    // 自定义词里带换行的，不往用户词库里记（词库是一行一条）
+    let kind = if text.contains(['\n', '\t']) {
+        CandidateKind::Plain
+    } else {
+        CandidateKind::Word
+    };
+    Candidate {
+        commit: text.clone(),
+        text,
+        pinyin,
+        consumed,
+        kind,
+        emoji: String::new(),
+    }
+}
+
 /// 首选是整句时按它推荐一个 emoji，插在第 [`EMOJI_SLOT`] 个。
 fn add_emoji_suggestion(all: &mut Vec<Candidate>, input_len: usize) {
     let Some(first) = all.first() else {
@@ -1499,16 +1575,28 @@ mod tests {
     }
 
     fn test_engine() -> Engine {
-        let lexicon: Arc<dyn Lexicon> = Arc::new(
-            MemoryLexicon::from_tsv_str(concat!(
-                "shi zhe yang\t是这样\t8000\n",
-                "ma\t吗\t900\n",
-                "ma\t马\t800\n",
-            ))
-            .unwrap(),
-        );
+        engine_from(concat!(
+            "shi zhe yang\t是这样\t8000\n",
+            "ma\t吗\t900\n",
+            "ma\t马\t800\n",
+        ))
+    }
+
+    fn engine_from(tsv: &str) -> Engine {
+        let lexicon: Arc<dyn Lexicon> = Arc::new(MemoryLexicon::from_tsv_str(tsv).unwrap());
         let lm: Arc<dyn LanguageModel> = Arc::new(BigramLm::default());
         Engine::new(lexicon, lm)
+    }
+
+    /// 重放/剥离用的词库：连续输入只有「是这样吗」这一条路，分段也能拼回同一句。
+    fn replay_engine() -> Engine {
+        engine_from(concat!(
+            "shi zhe yang ma\t是这样吗\t8000\n",
+            "shi zhe yang\t是这样\t6000\n",
+            "zhe yang\t这样\t5000\n",
+            "shi\t是\t1000\n",
+            "ma\t吗\t900\n",
+        ))
     }
 
     /// 打字，然后空格选首选。
@@ -1645,5 +1733,126 @@ mod tests {
         assert_eq!(session.prefix().len(), 5);
         assert_eq!(session.prefix()[0].text, "词1");
         assert_eq!(session.prefix()[4].text, "词5");
+    }
+
+    #[test]
+    fn segmented_input_matches_one_shot() {
+        let engine = replay_engine();
+
+        // 一口气打 shizheyangma：首选是整句
+        let mut continuous = Session::with_engine(&engine);
+        let one_shot = type_and_space(&mut continuous, "shizheyangma").unwrap();
+        assert_eq!(one_shot, "是这样吗");
+
+        // 分段打：先上屏「是这样」，再打 ma，首选就是「吗」
+        let mut segmented = Session::with_engine(&engine);
+        let first = type_and_space(&mut segmented, "shizheyang").unwrap();
+        assert_eq!(first, "是这样");
+        assert_eq!(segmented.prefix().len(), 1);
+
+        for c in "ma".chars() {
+            segmented.key(&Key::char(c));
+        }
+        let top = segmented.candidates()[0].clone();
+        assert_eq!(top.text, "吗");
+        assert_eq!(top.pinyin, "ma");
+        assert_eq!(top.consumed, "ma".len());
+
+        let second = segmented.key(&Key::press(keysym::SPACE)).commit.unwrap();
+        assert_eq!(second, "吗");
+        // 两次上屏拼起来和一口气打一样
+        assert_eq!(first + &second, one_shot);
+    }
+
+    #[test]
+    fn empty_prefix_decodes_like_before() {
+        let engine = replay_engine();
+        let mut session = Session::with_engine(&engine);
+        assert!(session.prefix().is_empty());
+        for c in "shizheyangma".chars() {
+            session.key(&Key::char(c));
+        }
+        // 链是空的：候选是整句，不是剥过的尾巴（和加前缀链之前一样）
+        let top = session.candidates()[0].clone();
+        assert_eq!(top.text, "是这样吗");
+        assert_eq!(top.pinyin, "shi zhe yang ma");
+        assert_eq!(top.consumed, "shizheyangma".len());
+    }
+
+    #[test]
+    fn replay_consumed_is_relative_to_the_typed_input() {
+        let engine = replay_engine();
+        let mut session = Session::with_engine(&engine);
+        // 链上只有一个「是」，现在打 zheyangma
+        session.commit_with("是", "shi");
+        for c in "zheyangma".chars() {
+            session.key(&Key::char(c));
+        }
+        let top = session.candidates()[0].clone();
+        assert_eq!(top.text, "这样吗");
+        assert_eq!(top.pinyin, "zhe yang ma");
+        assert_eq!(top.consumed, "zheyangma".len());
+
+        // 句首词候选（「是这样」）剥完是「这样」，用掉的字节相对这段输入
+        let head = session
+            .candidates()
+            .iter()
+            .find(|c| c.text == "这样")
+            .cloned()
+            .unwrap();
+        assert_eq!(head.pinyin, "zhe yang");
+        assert_eq!(head.consumed, "zheyang".len());
+        let remaining = session.remaining();
+        assert_eq!(&remaining[..head.consumed], "zheyang");
+        assert_eq!(&remaining[head.consumed..], "ma");
+    }
+
+    #[test]
+    fn replay_head_word_keeps_the_bytes_straight() {
+        let engine = replay_engine();
+        let mut session = Session::with_engine(&engine);
+        session.commit_with("是", "shi");
+        for c in "zheyangma".chars() {
+            session.key(&Key::char(c));
+        }
+        // 选剥过的句首词「这样」（重放里是「是这样」，用掉这段输入的 7 字节）
+        let index = session
+            .candidates()
+            .iter()
+            .position(|c| c.text == "这样")
+            .unwrap();
+        assert_eq!(session.choose(index).commit, None);
+        assert_eq!(session.selected_text(), "这样");
+        assert_eq!(session.remaining(), "ma");
+        // 剩下的 ma 接着选，上屏的是已选的词 + 它
+        assert_eq!(
+            session.key(&Key::press(keysym::SPACE)).commit.as_deref(),
+            Some("这样吗")
+        );
+    }
+
+    #[test]
+    fn replay_falls_back_for_custom_codes() {
+        let engine = replay_engine();
+        engine.lexicon().set_custom_tsv("mail\t我的邮箱\n");
+        let mut session = Session::with_engine(&engine);
+        session.commit_with("是这样", "shi zhe yang");
+        for c in "mail".chars() {
+            session.key(&Key::char(c));
+        }
+        // 自定义编码要跟整段输入对上，重放成 shizheyangmail 就查不到了
+        assert_eq!(session.candidates()[0].text, "我的邮箱");
+    }
+
+    #[test]
+    fn replay_falls_back_when_nothing_keeps_the_prefix() {
+        let engine = replay_engine();
+        let mut session = Session::with_engine(&engine);
+        session.commit_with("是这样", "shi zhe yang");
+        // 重放成 shizheyangqqq 解不出东西，剥完一个候选都不剩：照原来的路径解码
+        for c in "qqq".chars() {
+            session.key(&Key::char(c));
+        }
+        assert_eq!(session.candidates()[0].text, "qqq");
     }
 }
