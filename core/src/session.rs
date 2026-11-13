@@ -359,10 +359,14 @@ const CONTEXT_BYTES: usize = 24;
 /// 前缀链最多留多少个音节（16 个音节大约八个汉字，和 [`CONTEXT_BYTES`] 的上文差不多长；
 /// 再长重放串只在拖慢重算，早期打错的音节反而一直跟着）。
 const PREFIX_SYLLABLES: usize = 16;
-/// 重放只用链尾部的这么多音节：解码耗时随「前缀拼音 + 当前输入」的长度超线性涨
-/// （18 个字母已经是 2 个字母的三倍多），更早的词对下一个词的排序影响又很小。
-/// 至少留最新的一条记录，不切开一条（拼音和文字的对齐会崩）。
+/// 重放只看链尾部的这么多音节：解码耗时随「前缀拼音 + 当前输入」的长度涨
+/// （实测约每字母 +0.33ms），更早的词对下一个词的排序影响又很小。
+/// 必须有「至少留最新的一条」：一条记录不能切开，切了拼音和文字的对齐会崩。
 const REPLAY_SYLLABLES: usize = 8;
+/// 重放的字母预算（拼音串里的 ASCII 字母，音节之间的空格不算，不是字节）。
+/// 16 个字母 ≈ 5ms，是每按键能接受的上界。字母比音节更能代表耗时：单条记录
+/// 可能一次上屏了整句（20 多个字母），只看音节数会被它绕过。
+const REPLAY_LETTERS: usize = 16;
 /// emoji 推荐插在第几个（首选和次选后面）。
 const EMOJI_SLOT: usize = 2;
 
@@ -1149,19 +1153,34 @@ impl<'e> Session<'e> {
             .collect()
     }
 
-    /// 重放用的窗口：链尾部的记录，音节数不超过 [`REPLAY_SYLLABLES`]。从最后一条往前收，
-    /// 至少留最新的一条（一次上屏了整句也照样重放），已有的那条不会被切开。
+    /// 重放用的窗口：链尾部的整条记录，音节不超过 [`REPLAY_SYLLABLES`]、字母不超过
+    /// [`REPLAY_LETTERS`]（两个预算同时生效）。从最后一条往前收，一条记录都不切开。
+    ///
+    /// 最新那条自己就超预算时返回空窗口——这次不做重放，走普通解码。一次上屏整句之后
+    /// 打下一个词，重放的收益本来就弱（二元模型），退回普通解码更划算，也免得把
+    /// 每按键的耗时拖到十几毫秒。
+    ///
     /// 链的存储上限是 [`PREFIX_SYLLABLES`]，对账用的是整条链，这里只影响重放。
     fn replay_window(&self) -> &[Committed] {
-        let mut used = 0;
+        let mut syllables = 0;
+        let mut letters = 0;
         let mut start = self.prefix.len();
         while start > 0 {
-            let syllables = self.prefix[start - 1].pinyin.split_whitespace().count();
-            // start == len 时是第一条（最新的），不看上限
-            if start < self.prefix.len() && used + syllables > REPLAY_SYLLABLES {
+            let committed = &self.prefix[start - 1];
+            let entry_syllables = committed.pinyin.split_whitespace().count();
+            let entry_letters = pinyin_letters(&committed.pinyin);
+            if start == self.prefix.len() {
+                // 最新的一条自己就超预算：不切记录去凑，这次干脆不重放
+                if entry_letters > REPLAY_LETTERS {
+                    return &[];
+                }
+            } else if syllables + entry_syllables > REPLAY_SYLLABLES
+                || letters + entry_letters > REPLAY_LETTERS
+            {
                 break;
             }
-            used += syllables;
+            syllables += entry_syllables;
+            letters += entry_letters;
             start -= 1;
         }
         &self.prefix[start..]
@@ -1518,6 +1537,11 @@ impl<'e> Session<'e> {
     }
 }
 
+/// 拼音串里的字母数（音节之间的空格、隔音符不算，不是字节）。
+fn pinyin_letters(pinyin: &str) -> usize {
+    pinyin.bytes().filter(u8::is_ascii_alphabetic).count()
+}
+
 /// 引擎的一条候选换成会话的候选：用掉的字节夹在输入长度里，带换行的自定义词不学习。
 fn word_candidate(text: String, pinyin: String, consumed: usize, input_len: usize) -> Candidate {
     let consumed = if consumed == 0 || consumed > input_len {
@@ -1845,36 +1869,63 @@ mod tests {
 
     #[test]
     fn replay_window_keeps_only_the_tail_records() {
+        // 字母预算先到头：四条 5 字母的记录一共 20 个字母（音节才 8 个），只留后面三条
         let mut session = Session::new();
-        session.commit_with("是这样", "shi zhe yang"); // 3
-        session.commit_with("我们", "wo men"); // 2
-        session.commit_with("今天天气怎么样", "jin tian tian qi zen me yang"); // 7
-        assert_eq!(session.prefix().len(), 3, "链自己还是 12 个音节（上限 16）");
-        // 只有尾部那条 7 个音节的能进窗口（再加前面的「我们」就超 8 了）
-        assert_eq!(session.replay_window(), &session.prefix()[2..]);
+        for (word, pinyin) in [
+            ("你好", "ni hao"),
+            ("我们", "wo men"),
+            ("他们", "ta men"),
+            ("这里", "zhe li"),
+        ] {
+            session.commit_with(word, pinyin);
+        }
+        assert_eq!(session.prefix().len(), 4);
+        assert_eq!(
+            session.replay_window(),
+            &session.prefix()[1..],
+            "20 个字母超了 16 的预算，只留后面三条"
+        );
 
-        // 两条凑得进 8 个音节时两条都留，一条都不切开
+        // 音节预算先到头：都是两个字母的短音节，字母没超（14），音节超了（9）
         let mut session = Session::new();
-        session.commit_with("是这样", "shi zhe yang"); // 3
-        session.commit_with("我们", "wo men"); // 2
-        session.commit_with("今天天气", "jin tian tian qi"); // 4 → 一共 9
-        assert_eq!(session.replay_window(), &session.prefix()[1..]);
+        for pinyin in ["a", "e", "o", "ai", "ei", "ou", "an", "en", "a"] {
+            session.commit_with("啊", pinyin);
+        }
+        assert_eq!(session.replay_window().len(), 8, "九条只留最后八条");
 
-        // 最新那条自己就超过 8 个音节（一次上屏整句）：至少留它
+        // 两个预算都没超：整条链都进窗口，一条也不切开
         let mut session = Session::new();
-        session.commit_with("你好", "ni hao");
-        session.commit_with(
-            "今天天气怎么样啊朋友",
-            "jin tian tian qi zen me yang a peng you",
-        ); // 9 个音节
-        assert_eq!(session.replay_window(), &session.prefix()[1..]);
+        session.commit_with("我们", "wo men"); // 5 字母 / 2 音节
+        session.commit_with("今天", "jin tian"); // 7 字母 / 2 音节（一共 12 字母）
+        assert_eq!(session.replay_window(), session.prefix());
+
+        // 最新那条自己就超字母预算（一次上屏整句）：窗口空，这次不重放
+        let mut session = Session::new();
+        session.commit_with("是这样", "shi zhe yang");
+        session.commit_with("今天天气怎么样啊", "jin tian tian qi zen me yang a"); // 23 字母
+        assert!(
+            session.replay_window().is_empty(),
+            "最新一条 23 字母超预算：不切记录，这次不重放"
+        );
+    }
+
+    #[test]
+    fn replay_skips_a_prefix_over_the_letter_budget() {
+        let engine = merge_engine();
+        let mut session = Session::with_engine(&engine);
+        // 一次上屏整句（23 字母）后再打一个词：不重放，候选就是普通解码
+        session.commit_with("今天天气怎么样啊", "jin tian tian qi zen me yang a");
+        for c in "ma".chars() {
+            session.key(&Key::char(c));
+        }
+        assert_eq!(texts(&mut session), ["马", "妈", "吗"]);
     }
 
     #[test]
     fn replay_uses_the_tail_window_only() {
-        // 词库里只有「我们今天天气 + 吗」这条路（我们 + 今天天气吗）。链上有「是这样」时，
-        // 整个链重放会变成「是这样我们今天天气吗」，接不上窗口那段文字、一条都留不下，
-        // 只好回退到普通解码（首选「马」）；只重放尾部窗口才对得上「吗」。
+        // 窗口只留得下尾部那条「今天天气」（13 字母），整条链重放会拼成
+        // 「是这样我们今天天气吗」，接不上窗口那段文字、一条都留不下，只好回退到普通解码
+        // （首选「马」）；只重放窗口才对得上「吗」。
         let engine = engine_from(concat!(
             "wo men\t我们\t9000\n",
             "jin tian tian qi ma\t今天天气吗\t6000\n",
@@ -1885,6 +1936,11 @@ mod tests {
         session.commit_with("是这样", "shi zhe yang"); // 3
         session.commit_with("我们", "wo men"); // 2
         session.commit_with("今天天气", "jin tian tian qi"); // 4 → 一共 9
+        assert_eq!(
+            session.replay_window(),
+            &session.prefix()[2..],
+            "窗口只剩尾部那条"
+        );
         for c in "ma".chars() {
             session.key(&Key::char(c));
         }
