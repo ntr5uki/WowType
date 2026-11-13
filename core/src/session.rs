@@ -1110,24 +1110,46 @@ impl<'e> Session<'e> {
         // 已经选了开头的词时，把它当上文，剩下的部分排序更准
         let context = self.context.clone() + &self.selected_text();
         engine.set_context(utf8_tail(&context, CONTEXT_BYTES));
-        // 前面还上屏过别的词：把「前缀 + 这段输入」当成一条连续输入重新解码，
-        // 候选和一口气打一样（重放不了就照原路径解码）
-        if let Some(all) = self.replay_candidates(engine, input) {
-            return all;
-        }
-        let Ok(found) = engine.try_input(input) else {
-            return Vec::new();
+        // 前面还上屏过别的词：把「前缀 + 这段输入」当成一条连续输入重新解码，这些候选排最前，
+        // 首选和一口气打一样；后面再接普通解码的候选，恢复选择面（重放不了就只走普通解码）。
+        //
+        // 为什么不是二选一：连续输入会有重新切分前文的候选（`shizheyangma` 的第二候选
+        // 「是遮阳帽」），它把已上屏的「是这样」改掉了，分段模式下给不出来——「严格等同」
+        // 本来就不成立。所以重放只负责把接得上前缀的候选排到前面。
+        let mut all = match self.replay_candidates(engine, input) {
+            Some(mut replayed) => {
+                for candidate in self.plain_candidates(engine, input) {
+                    // 同一个词只留一条（留重放那条：consumed、拼音都是相对这段输入的）
+                    if !replayed.iter().any(|c| c.text == candidate.text) {
+                        replayed.push(candidate);
+                    }
+                }
+                replayed.truncate(engine.config().max_candidates.max(1));
+                replayed
+            }
+            // 链是空的（或者重放不了）：和没有前缀链时完全一样
+            None => self.plain_candidates(engine, input),
         };
-        let mut all: Vec<Candidate> = found
-            .into_iter()
-            .map(|c| word_candidate(c.text, c.pinyin, c.consumed, input.len()))
-            .collect();
         self.add_extras(&mut all, input, engine.config().shuangpin);
         all
     }
 
+    /// 只拿这段输入解码（不重放），原来的一路。
+    fn plain_candidates(&self, engine: &Engine, input: &str) -> Vec<Candidate> {
+        let Ok(found) = engine.try_input(input) else {
+            return Vec::new();
+        };
+        found
+            .into_iter()
+            .map(|c| word_candidate(c.text, c.pinyin, c.consumed, input.len()))
+            .collect()
+    }
+
     /// 前缀链上的词和现在打的这段拼成一条连续输入重新解码，再把前缀那段文字和拼音剥掉，
     /// 剩下的 `text` / `pinyin` / `consumed` 都和没重放时一样是相对这段输入的。
+    /// 返回的只是「接得上前缀」的那几条，普通解码的候选由 [`Session::plain_candidates`]
+    /// 另算，两边在 [`Session::compute_candidates`] 里合并（emoji、日期时间这些附加候选
+    /// 只在合并以后加一次）。
     ///
     /// 下面这些情况回退（None，照原来的路径解码）：
     ///
@@ -1179,8 +1201,6 @@ impl<'e> Session<'e> {
         if all.is_empty() {
             return None;
         }
-        // 重放只在全拼下走，所以附加候选按全拼算
-        self.add_extras(&mut all, input, false);
         Some(all)
     }
 
@@ -1779,6 +1799,94 @@ mod tests {
                 text: (*text).into(),
             })
             .collect()
+    }
+
+    /// 合并用：重放出来是「吗」，单独打 ma 是「马 妈 吗」（重放那条在普通解码里排最后）。
+    fn merge_engine() -> Engine {
+        engine_from(concat!(
+            "shi zhe yang ma\t是这样吗\t8000\n",
+            "shi zhe yang\t是这样\t6000\n",
+            "ma\t马\t9000\n",
+            "ma\t妈\t8000\n",
+            "ma\t吗\t500\n",
+        ))
+    }
+
+    /// 当前候选的字。
+    fn texts(session: &mut Session) -> Vec<String> {
+        session
+            .candidates()
+            .iter()
+            .map(|c| c.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn replay_candidates_come_first_then_the_plain_ones() {
+        let engine = merge_engine();
+        let mut session = Session::with_engine(&engine);
+        assert_eq!(
+            type_and_space(&mut session, "shizheyang").as_deref(),
+            Some("是这样")
+        );
+        for c in "ma".chars() {
+            session.key(&Key::char(c));
+        }
+        // 重放那条排最前（和一口气打一致），后面接普通解码的候选，恢复选择面
+        assert_eq!(texts(&mut session), ["吗", "马", "妈"]);
+        // 去重：「吗」只出现一次（留重放那条）
+        assert_eq!(texts(&mut session).iter().filter(|t| *t == "吗").count(), 1);
+    }
+
+    #[test]
+    fn empty_chain_candidates_are_the_plain_decode() {
+        let engine = merge_engine();
+        let mut session = Session::with_engine(&engine);
+        for c in "ma".chars() {
+            session.key(&Key::char(c));
+        }
+        // 链是空的：候选就是普通解码，顺序和内容都不变
+        assert_eq!(texts(&mut session), ["马", "妈", "吗"]);
+    }
+
+    #[test]
+    fn merged_candidates_are_truncated_to_the_engine_limit() {
+        let mut engine = merge_engine();
+        engine.set_max_candidates(2);
+        let mut session = Session::with_engine(&engine);
+        assert_eq!(
+            type_and_space(&mut session, "shizheyang").as_deref(),
+            Some("是这样")
+        );
+        for c in "ma".chars() {
+            session.key(&Key::char(c));
+        }
+        // 重放 1 条 + 普通 2 条 = 3 条，合并以后截到 2
+        assert_eq!(texts(&mut session), ["吗", "马"]);
+    }
+
+    #[test]
+    fn merged_candidates_add_extras_once() {
+        let engine = engine_from(concat!(
+            "shi zhe yang ba\t是这样吧\t8000\n",
+            "shi zhe yang\t是这样\t6000\n",
+            "ba\t吧\t9000\n",
+            "ba\t八\t8000\n",
+            "ba\t把\t7000\n",
+        ));
+        let mut session = Session::with_engine(&engine);
+        assert_eq!(
+            type_and_space(&mut session, "shizheyang").as_deref(),
+            Some("是这样")
+        );
+        for c in "ba".chars() {
+            session.key(&Key::char(c));
+        }
+        let texts = texts(&mut session);
+        assert_eq!(texts[0], "吧", "重放那条在最前：{texts:?}");
+        // 按键 emoji（八 → 8️⃣）只在合并以后加一次
+        assert_eq!(texts.iter().filter(|t| *t == "8️⃣").count(), 1, "{texts:?}");
+        assert_eq!(texts.iter().filter(|t| *t == "吧").count(), 1, "{texts:?}");
     }
 
     #[test]

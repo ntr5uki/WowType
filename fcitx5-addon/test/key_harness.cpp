@@ -214,12 +214,98 @@ void runCases(Instance &instance) {
     type(ic.get(), "nihao<sp>");
     check(ic->committed == "你好", "nihao 空格 -> 你好，实际 " + ic->committed);
 
+
+
     fresh(ic.get());
     type(ic.get(), "nihao,");
     check(ic->committed == "你好，", "打字途中按逗号：先上屏再出中文逗号，实际 " + ic->committed);
 
-    // 前缀链重放（ABI 1.10）：上屏「是这样」以后再打 ma，会话把「已上屏的 shi zhe yang + ma」
-    // 当一条连续输入重放，首选就是「吗」，和一口气打 shizheyangma 一致
+    // 下面几组都这样比：先看链还在时的候选，再（同一个上文、同一份学习状态）看链清掉以后
+    // 普通解码的候选。链断了就该和普通解码逐项一样。
+    auto plainMa = [&]() {
+        fresh(ic.get());
+        type(ic.get(), "ma");
+        return page(ic.get());
+    };
+    auto withChain = [&](const std::string &keys) {
+        fresh(ic.get());
+        type(ic.get(), "nihao<sp>");
+        type(ic.get(), keys);
+        type(ic.get(), "ma");
+        return page(ic.get());
+    };
+
+    // 链还在：候选和普通解码不一样（重放的那条排最前）
+    const auto alive = withChain("");
+    const auto plain = plainMa();
+    check(!alive.empty() && !plain.empty() && alive != plain,
+          "重放候选排最前：nihao + ma 的候选和单独打 ma 不一样（首选「" +
+              std::string(alive.empty() ? "" : alive[0]) + "」对「" +
+              std::string(plain.empty() ? "" : plain[0]) + "」）");
+
+    // 标点上屏清空前缀链（commitPlain）：上屏「你好，」以后再打 ma，候选回到普通解码
+    const auto afterPunct = withChain("nihao,");
+    check(afterPunct == plainMa(), "标点上屏清空前缀链：ma 的候选和普通解码逐项一样：" +
+                                       join(afterPunct));
+
+    // Esc（取消）、预编辑为空时的退格（应用侧删字）也断链
+    const auto afterEsc = withChain("<esc>");
+    check(afterEsc == plainMa(), "Esc 清空前缀链：ma 的候选和普通解码逐项一样：" + join(afterEsc));
+    const auto afterBackspace = withChain("<bs>");
+    check(afterBackspace == plainMa(),
+          "预编辑为空时按退格清空前缀链：ma 的候选和普通解码逐项一样：" + join(afterBackspace));
+
+    // 前缀链对账（ABI 1.11）：应用上报光标前文本时校验链。setText 的 cursor / anchor 是
+    // **字符**偏移（和真实前端上报的一样），不是字节
+    {
+        // 光标前是「前缀中文abc你好」（9 字符 / 21 字节）：链对得上，照样重放。
+        // 要是把 cursor 当字节用，这里会切在半个汉字上、对不上，链就没了
+        fresh(ic.get());
+        type(ic.get(), "nihao<sp>");
+        ic->surroundingText().setText("前缀中文abc你好", 9, 9);
+        type(ic.get(), "ma");
+        const auto kept = page(ic.get());
+        const auto keptPlain = plainMa();
+        check(kept != keptPlain && !kept.empty(),
+              "对账·前文和链一致：照样重放（首选「" +
+                  std::string(kept.empty() ? "" : kept[0]) + "」对普通解码「" +
+                  std::string(keptPlain.empty() ? "" : keptPlain[0]) + "」）");
+
+        // 用户把「你好」删成「你」：对不上，链整条丢掉，候选就是普通解码
+        fresh(ic.get());
+        type(ic.get(), "nihao<sp>");
+        ic->surroundingText().setText("前缀中文abc你", 8, 8);
+        type(ic.get(), "ma");
+        const auto dropped = page(ic.get());
+        check(dropped == plainMa(), "对账·前文少了字：链条丢掉，候选回到普通解码：" +
+                                        join(dropped));
+
+        // 有选区（anchor 在光标左边）：选区会被下一次输入替换，按选区左边那段算，链压着就截断
+        fresh(ic.get());
+        type(ic.get(), "nihao<sp>");
+        ic->surroundingText().setText("前缀中文abc你好", 9, 7);
+        type(ic.get(), "ma");
+        const auto selected = page(ic.get());
+        check(selected == plainMa(), "对账·选区压着链：链截断，候选回到普通解码：" +
+                                         join(selected));
+
+        // 拿不到前文（终端、WPS 这类应用）：什么都不做，链保持原样，照样重放
+        fresh(ic.get());
+        type(ic.get(), "nihao<sp>");
+        ic->surroundingText().invalidate();
+        type(ic.get(), "ma");
+        const auto invalid = page(ic.get());
+        const auto invalidPlain = plainMa();
+        check(invalid != invalidPlain && !invalid.empty(),
+              "对账·拿不到前文：不动链，照样重放（首选「" +
+                  std::string(invalid.empty() ? "" : invalid[0]) + "」对普通解码「" +
+                  std::string(invalidPlain.empty() ? "" : invalidPlain[0]) + "」）");
+        ic->surroundingText().invalidate();
+    }
+
+    // 前缀链重放 + 合并（ABI 1.10）：上屏「是这样」以后再打 ma，重放出来的「吗」排最前
+    // （和一口气打 shizheyangma 的首选一致），后面接着放普通解码的候选（马、妈……）。
+    // 连续输入会有重新切分前文的候选（「是遮阳帽」），分段模式给不出来，所以不是二选一。
     fresh(ic.get());
     type(ic.get(), "shizheyangma<sp>");
     const std::string oneShot = ic->committed;
@@ -230,64 +316,12 @@ void runCases(Instance &instance) {
     const auto replayed = page(ic.get());
     const std::string replayTop = replayed.empty() ? "" : replayed[0];
     type(ic.get(), "<sp>");
+    const bool hasHorse = std::find(replayed.begin(), replayed.end(), "马") != replayed.end();
     check(oneShot == "是这样吗" && alreadyCommitted == "是这样" && replayTop == "吗" &&
-              ic->committed == oneShot,
-          "分段 shizheyang / ma 和一口气打一样（首选「" + replayTop + "」，候选 " +
-              std::to_string(replayed.size()) + " 条），实际上屏「" + ic->committed + "」");
-
-    // 标点上屏清空前缀链（commitPlain）：上屏「是这样，」以后打 ma，候选回到普通解码的那几条
-    type(ic.get(), "shizheyang,");
-    type(ic.get(), "ma");
-    const auto plain = page(ic.get());
-    check(plain.size() > replayed.size(),
-          "标点上屏清空前缀链：ma 的候选是普通解码（" + std::to_string(plain.size()) + " 条 / 重放 " +
-              std::to_string(replayed.size()) + " 条），实际 " + join(plain));
-
-    // 前缀链对账（ABI 1.11）：应用上报光标前文本时校验链。setText 的 cursor / anchor 是
-    // **字符**偏移（和真实前端上报的一样），不是字节
-    {
-        // 光标前是「前缀中文abc是这样」（10 字符 / 24 字节）：链对得上，照样重放。
-        // 要是把 cursor 当字节用，这里会切在半个汉字上、对不上，链就没了
-        fresh(ic.get());
-        type(ic.get(), "shizheyang<sp>");
-        ic->surroundingText().setText("前缀中文abc是这样", 10, 10);
-        type(ic.get(), "ma");
-        const auto kept = page(ic.get());
-        check(kept.size() == 1 && !kept.empty() && kept[0] == "吗",
-              "对账·前文和链一致：光标在末尾，照样重放（候选 " + std::to_string(kept.size()) +
-                  " 条），实际 " + join(kept));
-
-        // 用户把「是这样」删成「是这」：对不上，链整条丢掉，候选回到普通解码
-        fresh(ic.get());
-        type(ic.get(), "shizheyang<sp>");
-        ic->surroundingText().setText("前缀中文abc是这", 9, 9);
-        type(ic.get(), "ma");
-        const auto dropped = page(ic.get());
-        check(dropped.size() > 1,
-              "对账·前文少了字：链条丢掉（候选回到普通解码 " + std::to_string(dropped.size()) +
-                  " 条），实际 " + join(dropped));
-
-        // 有选区（anchor 在光标左边）：选区会被下一次输入替换，按选区左边那段算，链压着就截断
-        fresh(ic.get());
-        type(ic.get(), "shizheyang<sp>");
-        ic->surroundingText().setText("前缀中文abc是这样", 10, 7);
-        type(ic.get(), "ma");
-        const auto selected = page(ic.get());
-        check(selected.size() > 1,
-              "对账·选区压着链：链截断（候选回到普通解码 " + std::to_string(selected.size()) +
-                  " 条），实际 " + join(selected));
-
-        // 拿不到前文（终端、WPS 这类应用）：什么都不做，链保持原样，照样重放
-        fresh(ic.get());
-        type(ic.get(), "shizheyang<sp>");
-        ic->surroundingText().invalidate();
-        type(ic.get(), "ma");
-        const auto invalid = page(ic.get());
-        check(invalid.size() == 1 && !invalid.empty() && invalid[0] == "吗",
-              "对账·拿不到前文：不动链，照样重放（候选 " + std::to_string(invalid.size()) +
-                  " 条），实际 " + join(invalid));
-        ic->surroundingText().invalidate();
-    }
+              ic->committed == oneShot && replayed.size() > 1 && hasHorse,
+          "分段 shizheyang / ma：首选「" + replayTop + "」和一口气打一样，候选 " +
+              std::to_string(replayed.size()) + " 条（含「马」），实际上屏「" + ic->committed +
+              "」");
 
     // 数字后的句点是小数点（#50）：数字原样交给应用，句点也原样
     fresh(ic.get());
