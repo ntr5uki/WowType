@@ -1105,12 +1105,24 @@ void WowtypeEngine::rememberContext(const std::string &text) {
     }
 }
 
+void WowtypeEngine::clearPrefix(fcitx::InputContext *ic) {
+    if (!ic) {
+        return;
+    }
+    if (auto *state = ic->propertyFor(&factory_)) {
+        wowtype_session_clear_prefix(state->session_);
+    }
+}
+
 void WowtypeEngine::commitPlain(fcitx::InputContext *ic, const std::string &text) {
     if (!ic || text.empty()) {
         return;
     }
     emit(ic, text);
     rememberContext(text);
+    // 标点、符号、数字、日期时间、表情、语音结果都没有拼音，拼不进重放串：前缀链整条清掉
+    // （会话上屏的选词有拼音，走 finishCommit，那里不清）
+    clearPrefix(ic);
 }
 
 void WowtypeEngine::finishCommit(fcitx::InputContext *ic, WowtypeState *state,
@@ -1571,6 +1583,8 @@ void WowtypeEngine::selectTool(fcitx::InputContext *ic, WowtypeState *state, std
         const std::string text = state->candidates_[index].commit;
         state->clear();
         if (!text.empty()) {
+            // 工具栏插入的剪贴板、常用语不是拼音打出来的
+            clearPrefix(ic);
             emit(ic, text);
         }
         updateInputPanel(ic, state);
@@ -1694,6 +1708,8 @@ void WowtypeEngine::commitEmoji(fcitx::InputContext *ic, WowtypeState *state,
     const WowtypeCandidate chosen = state->candidates_[index];
     const std::string text = state->selectedText() + chosen.commit;
     if (!text.empty()) {
+        // 面板里的 emoji、符号、日期没有拼音
+        clearPrefix(ic);
         emit(ic, text);
         rememberContext(text);
     }
@@ -2116,6 +2132,11 @@ void WowtypeEngine::keyEvent(const fcitx::InputMethodEntry & /*entry*/,
         return;
     }
 
+    // Esc 是「取消」：不管在不在打字，前缀链都断掉（在打的拼音由会话清，取消也是断上下文）
+    if (sym == FcitxKey_Escape) {
+        clearPrefix(ic);
+    }
+
     if (state->composing()) {
         // 只打了一个 v 再按空格：打开工具栏（vim、vscode 这些照常打字）
         // （互译模式下不开：工具栏选的字会绕过攒着的原文直接上屏）
@@ -2203,6 +2224,11 @@ void WowtypeEngine::keyEvent(const fcitx::InputMethodEntry & /*entry*/,
     if (state->composing()) {
         return;
     }
+    // 没在打字时收到退格 / Delete：应用侧在删光标前的字，前缀链和光标位置对不上了，整条清掉
+    // （Esc 在上面已经处理过；这两个键照常交给应用删）
+    if (sym == FcitxKey_BackSpace || sym == FcitxKey_Delete || sym == FcitxKey_KP_Delete) {
+        clearPrefix(ic);
+    }
     if (const WowtypeFrame *frame = sessionKey(state, key); frame && frame->handled) {
         applySessionFrame(ic, state, frame);
         event.filterAndAccept();
@@ -2275,6 +2301,9 @@ void WowtypeEngine::reset(const fcitx::InputMethodEntry & /*entry*/,
     // 有的应用重置时会自己把预编辑的字上屏，留着会重复。
     auto *state = ic->propertyFor(&factory_);
     state->clear();
+    // 换输入框 / 失去焦点：光标挪走了，前缀链和它已经对不上，整条清掉。
+    // 注意这里清的是前缀链，不是 wowtype_session_reset——那条路上完屏也会调一次。
+    clearPrefix(ic);
     clearTranslation(state);
     ic->inputPanel().reset();
     ic->updatePreedit();
@@ -2389,6 +2418,8 @@ void WowtypeEngine::switchMode(fcitx::InputContext *ic, WowtypeState *state, boo
         if (ic && state && !state->tsource_.empty()) {
             const std::string source = state->tsource_;
             clearTranslation(state);
+            // 攒着的原文是字母打出来的英文，没有拼音
+            clearPrefix(ic);
             ic->commitString(source);
         }
         translateMode_ = false;
@@ -2402,8 +2433,13 @@ void WowtypeEngine::switchMode(fcitx::InputContext *ic, WowtypeState *state, boo
         state->clear();
         updateInputPanel(ic, state);
     }
+    const bool modeChanged = asciiMode_ != ascii || translateMode_ != translate;
     asciiMode_ = ascii;
     translateMode_ = translate;
+    if (modeChanged && ic) {
+        // 换了模式：英文模式里打的字母、互译的译文都直接进应用，没有拼音，前缀链断掉
+        clearPrefix(ic);
+    }
     const char *name = translateMode_ ? "互译" : asciiMode_ ? "英文" : "中文";
     WLOG_I() << "WowType: 切到" << name;
     if (!ic) {
@@ -2721,6 +2757,8 @@ bool WowtypeEngine::autoSpaceKey(fcitx::InputContext *ic, const fcitx::Key &key)
     if (!needsAutoSpace(ic, text)) {
         return false;
     }
+    // 直接交给应用的字母 / 数字（还自动补了个空格）：没有拼音，上下文断了
+    clearPrefix(ic);
     ic->commitString(" " + text);
     return true;
 }
@@ -2935,6 +2973,8 @@ void WowtypeEngine::commitTranslation(fcitx::InputContext *ic, WowtypeState *sta
     if (fresh && phase == WOWTYPE_TRANSLATE_DONE) {
         const std::string text = wowtype_translate_text(translator_);
         clearTranslation(state);
+        // 译文没有拼音
+        clearPrefix(ic);
         ic->commitString(text);
         updateInputPanel(ic, state);
         return;
@@ -2958,6 +2998,8 @@ void WowtypeEngine::commitTranslateSource(fcitx::InputContext *ic, WowtypeState 
     }
     const std::string source = state->tsource_;
     clearTranslation(state);
+    // 原文没有拼音
+    clearPrefix(ic);
     ic->commitString(source);
     updateInputPanel(ic, state);
 }

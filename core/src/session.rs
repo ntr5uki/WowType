@@ -483,13 +483,18 @@ impl<'e> Session<'e> {
         &self.prefix
     }
 
-    /// 清空前缀链（换输入框、光标被挪走、应用侧删字；第 3 步接上外壳的这些信号）。
+    /// 清空前缀链：上下文断了（换输入框、光标被挪走、应用侧删字、没有拼音的上屏）。
+    /// C 接口是 `wowtype_session_clear_prefix`，fcitx5 外壳在 `WowtypeEngine::reset`、
+    /// 没在打字时的 Esc / 退格 / Delete、`commitPlain` 里调。
     ///
     /// 不要放进 `reset()`：外壳上完屏也会调一次 `_reset(0)`（fcitx5 的 `state->clear()`），
-    /// 那样每次选词都会把链清掉，重放永远不会生效。第 3 步给它单独的 C 接口，让外壳在真正
-    /// 断了上下文的地方（`WowtypeEngine::reset`、Esc、方向键、预编辑为空时的退格、`commitPlain`）调。
+    /// 那样每次选词都会把链清掉，重放永远不会生效。
     pub fn clear_prefix(&mut self) {
-        self.prefix.clear();
+        if !self.prefix.is_empty() {
+            self.prefix.clear();
+            // 候选是按重放串算的：链断了就重算（光标回到开头，和换上下文一样）
+            self.fresh = false;
+        }
     }
 
     /// 换掉读本地时间的函数（测试用）。

@@ -218,6 +218,31 @@ void runCases(Instance &instance) {
     type(ic.get(), "nihao,");
     check(ic->committed == "你好，", "打字途中按逗号：先上屏再出中文逗号，实际 " + ic->committed);
 
+    // 前缀链重放（ABI 1.10）：上屏「是这样」以后再打 ma，会话把「已上屏的 shi zhe yang + ma」
+    // 当一条连续输入重放，首选就是「吗」，和一口气打 shizheyangma 一致
+    fresh(ic.get());
+    type(ic.get(), "shizheyangma<sp>");
+    const std::string oneShot = ic->committed;
+    fresh(ic.get());
+    type(ic.get(), "shizheyang<sp>");
+    const std::string alreadyCommitted = ic->committed;
+    type(ic.get(), "ma");
+    const auto replayed = page(ic.get());
+    const std::string replayTop = replayed.empty() ? "" : replayed[0];
+    type(ic.get(), "<sp>");
+    check(oneShot == "是这样吗" && alreadyCommitted == "是这样" && replayTop == "吗" &&
+              ic->committed == oneShot,
+          "分段 shizheyang / ma 和一口气打一样（首选「" + replayTop + "」，候选 " +
+              std::to_string(replayed.size()) + " 条），实际上屏「" + ic->committed + "」");
+
+    // 标点上屏清空前缀链（commitPlain）：上屏「是这样，」以后打 ma，候选回到普通解码的那几条
+    type(ic.get(), "shizheyang,");
+    type(ic.get(), "ma");
+    const auto plain = page(ic.get());
+    check(plain.size() > replayed.size(),
+          "标点上屏清空前缀链：ma 的候选是普通解码（" + std::to_string(plain.size()) + " 条 / 重放 " +
+              std::to_string(replayed.size()) + " 条），实际 " + join(plain));
+
     // 数字后的句点是小数点（#50）：数字原样交给应用，句点也原样
     fresh(ic.get());
     type(ic.get(), "3.14");

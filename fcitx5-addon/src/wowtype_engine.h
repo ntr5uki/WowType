@@ -447,6 +447,9 @@ private:
     void commitInput(fcitx::InputContext *ic, WowtypeState *state);
     /// 上屏一段与拼音无关的文本（标点等），只更新上下文。
     void commitPlain(fcitx::InputContext *ic, const std::string &text);
+    /// 前缀链（上屏过的词 + 拼音，算候选时重放用）断掉：光标前的内容不是拼音打出来的
+    /// （标点、符号、工具栏插入、表情、译文、应用侧删字、取消输入、换输入框）时调。
+    void clearPrefix(fcitx::InputContext *ic);
     /// 选中光标所在的候选；没有候选时上屏原始输入（交给会话按一次空格）。
     void commitCurrent(fcitx::InputContext *ic, WowtypeState *state);
     void rememberContext(const std::string &text);

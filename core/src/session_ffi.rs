@@ -507,6 +507,22 @@ pub unsafe extern "C" fn wowtype_session_reset(
     handle.run("reset", |session| session.reset(commit_pending != 0))
 }
 
+/// 清空前缀链（1.10 起）：上下文断了的时候调——换输入框 / 失去焦点、取消输入（Esc）、
+/// 预编辑为空时应用侧删字（退格 / Delete）、没有拼音的上屏（标点、数字、日期时间、表情）。
+/// 返回 0 成功，-1 session 为 NULL。注意不要在每次上屏后调（`_reset` 那条路），那样重放不生效。
+#[no_mangle]
+pub unsafe extern "C" fn wowtype_session_clear_prefix(session: *mut WowtypeSession) -> c_int {
+    let Some(handle) = (unsafe { session.as_mut() }) else {
+        return -1;
+    };
+    let inner = &mut handle.session;
+    if panic::catch_unwind(panic::AssertUnwindSafe(|| inner.clear_prefix())).is_err() {
+        set_last_error("session clear_prefix panicked");
+        return -1;
+    }
+    0
+}
+
 // ---- 过渡函数：外壳还没挪完时用，挪完以后删掉（见 docs/ABI.md）----
 
 /// 全部原始输入（含已选词用掉的部分）。
@@ -708,6 +724,7 @@ mod tests {
 
     #[test]
     fn null_handles() {
+        assert_eq!(unsafe { wowtype_session_clear_prefix(ptr::null_mut()) }, -1);
         assert!(unsafe { wowtype_session_key(ptr::null_mut(), ptr::null()) }.is_null());
         assert!(unsafe { wowtype_session_reset(ptr::null_mut(), 0) }.is_null());
         assert_eq!(

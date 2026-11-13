@@ -1383,6 +1383,59 @@ fn brackets_pick_first_or_last_char() {
     assert!(engine.user_words().is_empty(), "以词定字不学词：{:?}", engine.user_words());
 }
 
+/// 重放用的词库：一口气打 shizheyangma 只有「是这样吗」一条路；单独打 ma 首选「马」，
+/// 这样「链还在（重放）」「链断了（普通解码）」的候选能区分开。
+const REPLAY_LEXICON: &str = "\
+shi zhe yang ma\t是这样吗\t8000
+shi zhe yang\t是这样\t6000
+ma\t马\t9000
+ma\t吗\t500
+";
+
+fn replay_engine() -> &'static Engine {
+    let lexicon: Arc<dyn Lexicon> = Arc::new(MemoryLexicon::from_tsv_str(REPLAY_LEXICON).unwrap());
+    Box::leak(Box::new(Engine::new(
+        lexicon,
+        Arc::new(BigramLm::default()),
+    )))
+}
+
+#[test]
+fn segmented_commit_matches_one_shot() {
+    // 一口气打：首选整句「是这样吗」
+    let mut session = with(replay_engine());
+    assert_eq!(
+        type_keys(&mut session, "shizheyangma<sp>").commit.as_deref(),
+        Some("是这样吗")
+    );
+
+    // 分段打：先上屏「是这样」，再打 ma，首选是「吗」（重放成 shizheyangma 再剥掉前缀）
+    let mut session = with(replay_engine());
+    assert_eq!(
+        type_keys(&mut session, "shizheyang<sp>").commit.as_deref(),
+        Some("是这样")
+    );
+    assert_eq!(session.prefix().len(), 1);
+    type_keys(&mut session, "ma");
+    assert_eq!(texts(&mut session)[0], "吗");
+    assert_eq!(type_keys(&mut session, "<sp>").commit.as_deref(), Some("吗"));
+}
+
+#[test]
+fn clearing_the_prefix_stops_the_replay() {
+    let mut session = with(replay_engine());
+    assert_eq!(
+        type_keys(&mut session, "shizheyang<sp>").commit.as_deref(),
+        Some("是这样")
+    );
+    type_keys(&mut session, "ma");
+    assert_eq!(texts(&mut session)[0], "吗", "链还在：按重放算候选");
+
+    // 外壳在上下文断了的地方调 clear_prefix（换输入框、没在打字时的 Esc、退格、标点上屏）
+    session.clear_prefix();
+    assert_eq!(texts(&mut session)[0], "马", "链断了：照普通解码");
+}
+
 #[test]
 fn brackets_fall_through_when_nothing_to_pick() {
     // 单字候选：交给外壳（外壳先上屏再出【】）

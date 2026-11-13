@@ -16,7 +16,7 @@
  * 删函数或改参数含义时升主版本。外壳启动时用 wowtype_abi_version() 比对主版本。
  * 规则见 docs/ABI.md。 */
 #define WOWTYPE_ABI_VERSION_MAJOR 1
-#define WOWTYPE_ABI_VERSION_MINOR 9
+#define WOWTYPE_ABI_VERSION_MINOR 10
 
 #ifdef __cplusplus
 extern "C" {
@@ -410,6 +410,12 @@ void wowtype_session_configure(WowtypeSession *session, const WowtypeSessionConf
 const WowtypeFrame *wowtype_session_frame(WowtypeSession *session);
 /* 处理一次按键（按下和松开都给）。session 或 key 为 NULL 时返回 NULL。 */
 const WowtypeFrame *wowtype_session_key(WowtypeSession *session, const WowtypeKey *key);
+/* 清空前缀链（1.10 起）：上下文断了的时候调——换输入框 / 失去焦点、取消输入（Esc）、
+ * 预编辑为空时应用侧删字（退格 / Delete）、没有拼音的上屏（标点、数字、日期时间、表情）。
+ * 前缀链是「上屏过的词 + 它们的拼音」，算候选时拼成连续输入重放，让分段输入的候选和一口气打
+ * 一样。返回 0 成功，-1 session 为 NULL。
+ * 不要在每次上屏后调（如 _reset 那条路）：那样每次选词都会清空，重放等于没用。 */
+int wowtype_session_clear_prefix(WowtypeSession *session);
 /* 清空编辑区；commit_pending 非 0 时，已选的词 + 原始输入放进 frame->commit（切换输入法、
  * 打字途中切英文时，和回车一样），原始输入也记一次选词。 */
 const WowtypeFrame *wowtype_session_reset(WowtypeSession *session, int commit_pending);

@@ -267,6 +267,8 @@ int main(int argc, char **argv) {
               "session: last choice");
         wowtype_session_set_engine(s, NULL);
         check(wowtype_session_candidate_total(s) == 0, "session: engine unset");
+        check(wowtype_session_clear_prefix(s) == 0, "session: clear prefix");
+        check(wowtype_session_clear_prefix(NULL) != 0, "session: clear prefix without a session");
         wowtype_session_free(s);
     }
 
