@@ -359,6 +359,10 @@ const CONTEXT_BYTES: usize = 24;
 /// 前缀链最多留多少个音节（16 个音节大约八个汉字，和 [`CONTEXT_BYTES`] 的上文差不多长；
 /// 再长重放串只在拖慢重算，早期打错的音节反而一直跟着）。
 const PREFIX_SYLLABLES: usize = 16;
+/// 重放只用链尾部的这么多音节：解码耗时随「前缀拼音 + 当前输入」的长度超线性涨
+/// （18 个字母已经是 2 个字母的三倍多），更早的词对下一个词的排序影响又很小。
+/// 至少留最新的一条记录，不切开一条（拼音和文字的对齐会崩）。
+const REPLAY_SYLLABLES: usize = 8;
 /// emoji 推荐插在第几个（首选和次选后面）。
 const EMOJI_SLOT: usize = 2;
 
@@ -1145,6 +1149,24 @@ impl<'e> Session<'e> {
             .collect()
     }
 
+    /// 重放用的窗口：链尾部的记录，音节数不超过 [`REPLAY_SYLLABLES`]。从最后一条往前收，
+    /// 至少留最新的一条（一次上屏了整句也照样重放），已有的那条不会被切开。
+    /// 链的存储上限是 [`PREFIX_SYLLABLES`]，对账用的是整条链，这里只影响重放。
+    fn replay_window(&self) -> &[Committed] {
+        let mut used = 0;
+        let mut start = self.prefix.len();
+        while start > 0 {
+            let syllables = self.prefix[start - 1].pinyin.split_whitespace().count();
+            // start == len 时是第一条（最新的），不看上限
+            if start < self.prefix.len() && used + syllables > REPLAY_SYLLABLES {
+                break;
+            }
+            used += syllables;
+            start -= 1;
+        }
+        &self.prefix[start..]
+    }
+
     /// 前缀链上的词和现在打的这段拼成一条连续输入重新解码，再把前缀那段文字和拼音剥掉，
     /// 剩下的 `text` / `pinyin` / `consumed` 都和没重放时一样是相对这段输入的。
     /// 返回的只是「接得上前缀」的那几条，普通解码的候选由 [`Session::plain_candidates`]
@@ -1161,15 +1183,15 @@ impl<'e> Session<'e> {
         if self.prefix.is_empty() || engine.config().shuangpin || engine.has_custom_code(input) {
             return None;
         }
-        let syllables: Vec<&str> = self
-            .prefix
+        let window = self.replay_window();
+        let syllables: Vec<&str> = window
             .iter()
             .flat_map(|c| c.pinyin.split_whitespace())
             .collect();
         if syllables.is_empty() {
             return None;
         }
-        let prefix_text: String = self.prefix.iter().map(|c| c.text.as_str()).collect();
+        let prefix_text: String = window.iter().map(|c| c.text.as_str()).collect();
         // 重放串就是「一口气打完」的样子：音节之间不留空格
         let prefix_pinyin: String = syllables.concat();
         let prefix_bytes = prefix_pinyin.len();
@@ -1819,6 +1841,58 @@ mod tests {
             .iter()
             .map(|c| c.text.clone())
             .collect()
+    }
+
+    #[test]
+    fn replay_window_keeps_only_the_tail_records() {
+        let mut session = Session::new();
+        session.commit_with("是这样", "shi zhe yang"); // 3
+        session.commit_with("我们", "wo men"); // 2
+        session.commit_with("今天天气怎么样", "jin tian tian qi zen me yang"); // 7
+        assert_eq!(session.prefix().len(), 3, "链自己还是 12 个音节（上限 16）");
+        // 只有尾部那条 7 个音节的能进窗口（再加前面的「我们」就超 8 了）
+        assert_eq!(session.replay_window(), &session.prefix()[2..]);
+
+        // 两条凑得进 8 个音节时两条都留，一条都不切开
+        let mut session = Session::new();
+        session.commit_with("是这样", "shi zhe yang"); // 3
+        session.commit_with("我们", "wo men"); // 2
+        session.commit_with("今天天气", "jin tian tian qi"); // 4 → 一共 9
+        assert_eq!(session.replay_window(), &session.prefix()[1..]);
+
+        // 最新那条自己就超过 8 个音节（一次上屏整句）：至少留它
+        let mut session = Session::new();
+        session.commit_with("你好", "ni hao");
+        session.commit_with(
+            "今天天气怎么样啊朋友",
+            "jin tian tian qi zen me yang a peng you",
+        ); // 9 个音节
+        assert_eq!(session.replay_window(), &session.prefix()[1..]);
+    }
+
+    #[test]
+    fn replay_uses_the_tail_window_only() {
+        // 词库里只有「我们今天天气 + 吗」这条路（我们 + 今天天气吗）。链上有「是这样」时，
+        // 整个链重放会变成「是这样我们今天天气吗」，接不上窗口那段文字、一条都留不下，
+        // 只好回退到普通解码（首选「马」）；只重放尾部窗口才对得上「吗」。
+        let engine = engine_from(concat!(
+            "wo men\t我们\t9000\n",
+            "jin tian tian qi ma\t今天天气吗\t6000\n",
+            "ma\t马\t9000\n",
+            "ma\t吗\t500\n",
+        ));
+        let mut session = Session::with_engine(&engine);
+        session.commit_with("是这样", "shi zhe yang"); // 3
+        session.commit_with("我们", "wo men"); // 2
+        session.commit_with("今天天气", "jin tian tian qi"); // 4 → 一共 9
+        for c in "ma".chars() {
+            session.key(&Key::char(c));
+        }
+        // 首选是重放剥出来的「吗」（普通解码首选是「马」），拼音和字节都只相对这段输入
+        let first = session.candidates()[0].clone();
+        assert_eq!(first.text, "吗");
+        assert_eq!(first.pinyin, "ma");
+        assert_eq!(first.consumed, "ma".len());
     }
 
     #[test]
