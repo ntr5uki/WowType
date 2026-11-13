@@ -1114,6 +1114,40 @@ void WowtypeEngine::clearPrefix(fcitx::InputContext *ic) {
     }
 }
 
+void WowtypeEngine::reconcilePrefix(fcitx::InputContext *ic) {
+    if (!ic) {
+        return;
+    }
+    const fcitx::SurroundingText &surrounding = ic->surroundingText();
+    // 拿不到前文（终端、WPS 这类应用，或者刚激活还没上报）：什么都不做，链保持原样。
+    // 这里绝不能拿空串去对账，那样会把链清掉。
+    if (!surrounding.isValid()) {
+        return;
+    }
+    const std::string &text = surrounding.text();
+    // cursor() / anchor() 是**字符**偏移（实测「前缀中文abc后缀X」22 字节 / 10 字符，上报 10），
+    // 不是字节：汉字 3 字节、emoji 4 字节，按字节取会切在半个字上。
+    const size_t chars = fcitx::utf8::lengthValidated(text);
+    if (chars == fcitx::utf8::INVALID_LENGTH) {
+        // 前文不是合法 UTF-8：不猜，链保持原样
+        return;
+    }
+    // 有选区（anchor != cursor）时取两者靠左的那个：选区会被下一次输入替换掉，
+    // 只有它左边那段才是「不会变的光标前文本」。链要是压着选区，就对不上、自己截断。
+    const size_t at = std::min({static_cast<size_t>(surrounding.cursor()),
+                                static_cast<size_t>(surrounding.anchor()), chars});
+    const char *begin = text.c_str();
+    const size_t bytes = static_cast<size_t>(fcitx_utf8_get_nth_char(begin, at) - begin);
+    auto *state = ic->propertyFor(&factory_);
+    if (bytes == text.size()) {
+        // 光标在末尾（常见）：直接用原串，不复制
+        wowtype_session_reconcile_prefix(state->session_, begin);
+        return;
+    }
+    const std::string before(text, 0, bytes);
+    wowtype_session_reconcile_prefix(state->session_, before.c_str());
+}
+
 void WowtypeEngine::commitPlain(fcitx::InputContext *ic, const std::string &text) {
     if (!ic || text.empty()) {
         return;
@@ -1173,9 +1207,19 @@ void WowtypeEngine::syncSession(WowtypeState *state) {
     wowtype_session_configure(state->session_, &config);
 }
 
-const WowtypeFrame *WowtypeEngine::sessionKey(WowtypeState *state, const fcitx::Key &key,
-                                              uint32_t action) {
+const WowtypeFrame *WowtypeEngine::sessionKey(fcitx::InputContext *ic, WowtypeState *state,
+                                              const fcitx::Key &key, uint32_t action) {
     coreReady();
+    // 把键交给会话之前对一次账：应用有前文时，光标前的内容变了（删字、挪光标、在别处改字）
+    // 链就跟着截断。放在这里是因为只有这条路上会算候选；语音热键、面板翻页这些不走会话的
+    // 键、以及 activate 时都不用对，也就不用每次都拷一遍前文。
+    //
+    // 只在**没在打字**时对：客户端渲染预编辑的应用（GTK/Electron 一类）上报的前文里
+    // 带着我们自己的预编辑（「是这样ma」），边打边对会把链误判成对不上。不在打字时
+    // 前文里没有预编辑，也正好是用户可能删字、挪光标的时刻（下一句的第一个键）。
+    if (ic && !state->composing()) {
+        reconcilePrefix(ic);
+    }
     syncSession(state);
     return state->sessionKey(static_cast<uint32_t>(key.sym()),
                              static_cast<uint32_t>(key.states()), action);
@@ -2031,7 +2075,7 @@ void WowtypeEngine::commitCandidate(fcitx::InputContext *ic,
 
 void WowtypeEngine::commitCurrent(fcitx::InputContext *ic, WowtypeState *state) {
     // 和按空格一样：上屏光标处的候选，没有候选时上屏原始输入
-    const WowtypeFrame *frame = sessionKey(state, fcitx::Key(FcitxKey_space));
+    const WowtypeFrame *frame = sessionKey(ic, state, fcitx::Key(FcitxKey_space));
     if (frame && frame->handled) {
         applySessionFrame(ic, state, frame);
     }
@@ -2120,7 +2164,7 @@ void WowtypeEngine::keyEvent(const fcitx::InputMethodEntry & /*entry*/,
     if (state->composing() && (key.states().test(fcitx::KeyState::Ctrl) ||
                                key.states().test(fcitx::KeyState::Alt) ||
                                key.states().test(fcitx::KeyState::Super))) {
-        if (const WowtypeFrame *frame = sessionKey(state, key); frame && frame->handled) {
+        if (const WowtypeFrame *frame = sessionKey(ic, state, key); frame && frame->handled) {
             applySessionFrame(ic, state, frame);
             event.filterAndAccept();
             return;
@@ -2151,7 +2195,7 @@ void WowtypeEngine::keyEvent(const fcitx::InputMethodEntry & /*entry*/,
         // （[Hotkey/PrevPage] 等，比如 , . 翻页）翻成动作一起交给会话：按了就算翻不动也吃掉，
         // 不让它变成标点把字上屏
         const bool wasExpanded = state->expanded_;
-        const WowtypeFrame *frame = sessionKey(state, key, keyAction(key));
+        const WowtypeFrame *frame = sessionKey(ic, state, key, keyAction(key));
         if (frame && frame->handled) {
             applySessionFrame(ic, state, frame);
             event.filterAndAccept();
@@ -2229,7 +2273,7 @@ void WowtypeEngine::keyEvent(const fcitx::InputMethodEntry & /*entry*/,
     if (sym == FcitxKey_BackSpace || sym == FcitxKey_Delete || sym == FcitxKey_KP_Delete) {
         clearPrefix(ic);
     }
-    if (const WowtypeFrame *frame = sessionKey(state, key); frame && frame->handled) {
+    if (const WowtypeFrame *frame = sessionKey(ic, state, key); frame && frame->handled) {
         applySessionFrame(ic, state, frame);
         event.filterAndAccept();
     }

@@ -25,6 +25,7 @@
 | 1.8 | 0.3.11 | 以词定字：`WowtypeSessionConfig` 末尾加 `pick_char`（默认 1），打拼音途中 `[` `]` 上屏光标处候选的第一个、最后一个字（`page_keys` 带 `[ ]` 时让给翻页） |
 | 1.9 | 0.3.11 | 加 `wowtype_engine_set_rare_ext_chars`：是否出 CJK 扩展 B 区及以后的单字（通用规范汉字表里的除外），默认不出（以前总是出） |
 | 1.10 | 0.3.12 | 加 `wowtype_session_clear_prefix`：清空前缀链（上屏过的词 + 拼音）。算候选时把前缀链拼成连续输入重放，分段输入的候选和一口气打一样；外壳在上下文断了的地方（换输入框 / 失去焦点、没在打字时的 Esc、预编辑为空时的退格 / Delete、`commitPlain` 这类没有拼音的上屏）调它 |
+| 1.11 | 0.3.12 | 加 `wowtype_session_reconcile_prefix`：拿应用上报的「光标前文本」对账，链尾部文字和它求最长公共后缀（整个词对得上才算），只保留对得上的最后几条，一条都对不上就清空。fcitx5 外壳每次把键交给会话前调（`surroundingText().isValid()` 时，`cursor()` 是字符偏移要先换算成字节） |
 
 ## 所有权和生命周期
 
@@ -45,17 +46,18 @@
 - 返回指针的函数失败时返回 NULL，返回 `int` 的失败时返回负数（个别函数的约定写在头文件注释里）。
 - 失败原因用 `wowtype_last_error()` 取（线程局部）。
 
-## 输入会话（`wowtype_session_*`，1.3 起，1.4 加候选，1.5 加选词，1.6 加选词键、翻页和展开面板，1.7 加 Ctrl+Delete 忘掉学错的词，1.10 加清空前缀链）
+## 输入会话（`wowtype_session_*`，1.3 起，1.4 加候选，1.5 加选词，1.6 加选词键、翻页和展开面板，1.7 加 Ctrl+Delete 忘掉学错的词，1.10 加清空前缀链，1.11 加对账）
 
 输入行为正在从 fcitx5 外壳一块一块挪进核心（[PORTING.md](PORTING.md) 第 2 步），外壳以后主要依赖这一组。
 
-- **暂定**：挪完之前，这组函数不在上面「只加不删」的承诺里。标了「过渡」的函数（`wowtype_session_input`、`_remaining`、`_selected_text`、`_append`、`_set_context`、`_candidate_total`、`_candidate_info`、`_choose`、`_view`、`_last_choice`）是给还没挪完的 fcitx5 外壳用的，挪完就删（`_choose` 现在只给标点上屏首选和鼠标点候选用，标点挪进来、点候选改用 `_select` 以后删；`_view`、`_last_choice` 是外壳照会话摆候选框、上屏后记 emoji 用的，候选框整个由 frame 驱动以后删）；删的时候次版本加一，写进上面的版本记录。fcitx5 外壳和核心一起发版，不受影响；别的外壳先只用 `_new`、`_set_engine`、`_configure`、`_key`、`_frame`、`_candidate`、`_select`、`_reset`、`_clear_prefix`、`_free`。
+- **暂定**：挪完之前，这组函数不在上面「只加不删」的承诺里。标了「过渡」的函数（`wowtype_session_input`、`_remaining`、`_selected_text`、`_append`、`_set_context`、`_candidate_total`、`_candidate_info`、`_choose`、`_view`、`_last_choice`）是给还没挪完的 fcitx5 外壳用的，挪完就删（`_choose` 现在只给标点上屏首选和鼠标点候选用，标点挪进来、点候选改用 `_select` 以后删；`_view`、`_last_choice` 是外壳照会话摆候选框、上屏后记 emoji 用的，候选框整个由 frame 驱动以后删）；删的时候次版本加一，写进上面的版本记录。fcitx5 外壳和核心一起发版，不受影响；别的外壳先只用 `_new`、`_set_engine`、`_configure`、`_key`、`_frame`、`_candidate`、`_select`、`_reset`、`_clear_prefix`、`_reconcile_prefix`、`_free`。
 - **`handled`**：现在 0 的意思是「会话还不管这个键」，外壳接着用自己的逻辑处理。挪完以后 0 就是「交给应用」。还在外壳里的：标点、工具栏、表情面板、中 / 英 / 译和互译、语音键。
 - **候选框**（1.6）：frame 的 `cand_count` 是候选框里显示的个数（一页，或展开面板的一屏），`cand_cursor` 是光标在里面的位置（光标不在这一页上时是 -1），`has_prev` / `has_next` 是还能不能往前 / 往后翻，`panel` 说现在是普通候选框还是展开面板；显示的第 i 个用 `wowtype_session_candidate(s, i)` 取，点它用 `wowtype_session_select(s, i)`。
 - **结构体**：`WowtypeKey`、`WowtypeSessionConfig`、`WowtypeFrame`、`WowtypeCandidateInfo` 第一个字段都是 `size`。外壳填 `sizeof`，核心按它读，缺的字段当 0（`WowtypeSessionConfig` 例外：缺的字段用默认值）；核心返回的 frame 也带 `size`，外壳读新字段前先看它。
 - **所有权**：`wowtype_session_new` 的结果用 `wowtype_session_free` 释放。`_key`、`_reset` 返回的 `WowtypeFrame *`、里面的字符串、过渡函数返回的字符串，都归会话所有，**在同一个会话的下一次调用前有效**（包括松开键那一次），不是线程局部缓冲。要留着就自己拷。
 - **引擎**：候选和分音节要用引擎。`wowtype_session_new` 的 engine 可以传 NULL（词库在后台载入，载入好之前也要能打字，这时没有候选，编辑区是原始输入），载入好了用 `wowtype_session_set_engine` 补上。引擎要比会话活得久（或者先 `set_engine(NULL)`）。双拼开不开看引擎（`wowtype_engine_set_shuangpin`）；会话算候选时会把引擎的上文设成「已上屏的字 + 已选的词」的尾部。
 - **前缀链**（1.10）：空格 / 整句上的词会连拼音一起记进会话，算候选时把「前缀拼音 + 现在打的这段」拼成一条连续输入重新解码，再把候选里的前缀文字和音节剥掉，所以分段输入的候选和一口气打一样（`shizheyang` 空格、再打 `ma`，首选是「吗」，和一口气打 `shizheyangma` 出「是这样吗」一致）。双拼、自定义编码、剥完一条都不剩时照原来的解码。链上只有两种操作：上屏时追加（没有拼音的上屏追加不了，直接清空）；`_clear_prefix` 清空。外壳要在上下文断了的地方调 `_clear_prefix`，**不要**在每次上屏后的 `_reset` 里清。
+- **对账**（1.11）：能拿到 surrounding text 的应用里，外壳把键交给会话前用「光标前文本」调 `_reconcile_prefix`，用户删字、挪光标、在别处改字时链跟着截断或清空；一条都对不上就整条丢掉。fcitx5 外壳只在**没在打字时**调（客户端渲染预编辑的应用上报的前文里带着我们自己的预编辑，边打边对会误判），`surroundingText.cursor()` 是字符偏移、要换算成字节。拿不到前文的应用（终端、WPS，`surroundingText().isValid()` 为 0）**不要调**，也不要传空串代替。
 - **候选缓存**：候选用到的时候才算（`_key`、`_frame` 要分音节时，或读候选时），编辑区、上文、引擎、设置都没变就不重算。
 - **线程**：一个会话只在一个线程里用。
 - **键码**：`keysym` 是 XKB keysym 的子集，`modifiers` 是 `WOWTYPE_MOD_*`（取值和 X11 / fcitx5 的 KeyState 一样）。macOS 外壳把 `kVK_*` / `flagsChanged:` 翻成这个。

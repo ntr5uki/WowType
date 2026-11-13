@@ -497,6 +497,37 @@ impl<'e> Session<'e> {
         }
     }
 
+    /// 拿应用上报的「光标前文本」对账：链上各条的 `text` 拼起来，和它求最长公共后缀，
+    /// 只保留对得上的最后几条。用户删了字、挪了光标、在别处改了字时链跟着截断或者整条丢掉。
+    ///
+    /// 从最后一条往前比：这条整个是前文的后缀才算对上（只对上半个词的不要，重放得按词来）。
+    /// 一条都对不上（前文更短、或者完全不一样）就整条清空——文字和屏幕上对不上时，
+    /// 重放出来的候选也是错的。链本来就是空的什么都不做。
+    ///
+    /// 只在拿得到前文的应用里调（fcitx5 的 `surroundingText().isValid()`）；拿不到前文
+    /// （终端、WPS）不要调，别拿空文本把链清掉。
+    pub fn reconcile_prefix(&mut self, text_before_cursor: &str) {
+        if self.prefix.is_empty() {
+            return;
+        }
+        let mut tail = text_before_cursor;
+        let mut keep = 0;
+        for committed in self.prefix.iter().rev() {
+            let Some(rest) = tail.strip_suffix(committed.text.as_str()) else {
+                break;
+            };
+            tail = rest;
+            keep += 1;
+        }
+        if keep == self.prefix.len() {
+            // 完全对上：链不动，候选也不用重算
+            return;
+        }
+        let drop = self.prefix.len() - keep;
+        self.prefix.drain(..drop);
+        self.fresh = false;
+    }
+
     /// 换掉读本地时间的函数（测试用）。
     pub fn set_clock(&mut self, clock: Clock) {
         self.clock = clock;
@@ -1738,6 +1769,149 @@ mod tests {
         assert_eq!(session.prefix().len(), 5);
         assert_eq!(session.prefix()[0].text, "词1");
         assert_eq!(session.prefix()[4].text, "词5");
+    }
+
+    fn chain(texts: &[(&str, &str)]) -> Vec<Committed> {
+        texts
+            .iter()
+            .map(|(text, pinyin)| Committed {
+                pinyin: (*pinyin).into(),
+                text: (*text).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_keeps_the_chain_when_it_matches() {
+        let mut session = Session::new();
+        session.commit_with("是这样", "shi zhe yang");
+        session.commit_with("吗", "ma");
+        let before = session.prefix().to_vec();
+
+        // 光标前就是链上的字：不动
+        session.reconcile_prefix("是这样吗");
+        assert_eq!(session.prefix(), before);
+
+        // 前面还有别的字也对：只要链是它的后缀就算对上
+        session.reconcile_prefix("前面还有话，是这样吗");
+        assert_eq!(session.prefix(), before);
+
+        // 链本来就是空的：什么也不发生
+        let mut empty = Session::new();
+        empty.reconcile_prefix("随便什么");
+        assert!(empty.prefix().is_empty());
+    }
+
+    #[test]
+    fn reconcile_truncates_to_the_matching_tail() {
+        let mut session = Session::new();
+        session.commit_with("是", "shi");
+        session.commit_with("这样", "zhe yang");
+        session.commit_with("吗", "ma");
+        assert_eq!(
+            session.prefix(),
+            chain(&[("是", "shi"), ("这样", "zhe yang"), ("吗", "ma")])
+        );
+
+        // 只剩最后两条：前面的「是」用户删掉了
+        session.reconcile_prefix("这样吗");
+        assert_eq!(
+            session.prefix(),
+            chain(&[("这样", "zhe yang"), ("吗", "ma")])
+        );
+
+        // 只剩最后一条
+        session.reconcile_prefix("吗");
+        assert_eq!(session.prefix(), chain(&[("吗", "ma")]));
+
+        // 只对上半个词不算（「吗」对上了，但只留它）
+        session.reconcile_prefix("吗吗");
+        assert_eq!(session.prefix(), chain(&[("吗", "ma")]));
+    }
+
+    #[test]
+    fn reconcile_drops_a_partially_matched_word() {
+        let mut session = Session::new();
+        session.commit_with("是这样", "shi zhe yang");
+        // 最后一条只对上「样」这半个词：按词对不上，整条丢掉
+        session.reconcile_prefix("样");
+        assert!(session.prefix().is_empty());
+    }
+
+    #[test]
+    fn reconcile_clears_when_nothing_matches() {
+        let mut session = Session::new();
+        session.commit_with("是这样", "shi zhe yang");
+        // 完全不相干
+        session.reconcile_prefix("完全不相干");
+        assert!(session.prefix().is_empty());
+
+        // 空串（光标在最前面）
+        let mut session = Session::new();
+        session.commit_with("是这样", "shi zhe yang");
+        session.reconcile_prefix("");
+        assert!(session.prefix().is_empty());
+    }
+
+    #[test]
+    fn reconcile_handles_multibyte_text() {
+        let mut session = Session::new();
+        session.commit_with("是这样", "shi zhe yang");
+        // 中文后缀：按字符对得上，不能按字节乱切
+        session.reconcile_prefix("前缀中文abc是这样");
+        assert_eq!(session.prefix(), chain(&[("是这样", "shi zhe yang")]));
+
+        // 光标前正好切在汉字中间那种「半条链」：对不上就丢
+        session.reconcile_prefix("前缀中文abc是这");
+        assert!(session.prefix().is_empty());
+
+        // emoji（4 字节）和中文混在一起
+        let mut session = Session::new();
+        session.commit_with("你好", "ni hao");
+        session.reconcile_prefix("😀你好");
+        assert_eq!(session.prefix(), chain(&[("你好", "ni hao")]));
+        session.reconcile_prefix("😀你");
+        assert!(session.prefix().is_empty());
+    }
+
+    /// 对账测试用：重放出来是「是这样吗」（剥完「吗」），单独打 ma 首选是「马」。
+    fn reconcile_engine() -> Engine {
+        engine_from(concat!(
+            "shi zhe yang ma\t是这样吗\t8000\n",
+            "shi zhe yang\t是这样\t6000\n",
+            "ma\t马\t9000\n",
+            "ma\t吗\t500\n",
+        ))
+    }
+
+    #[test]
+    fn reconcile_invalidates_candidates_when_the_chain_changes() {
+        let engine = reconcile_engine();
+        let mut session = Session::with_engine(&engine);
+        assert_eq!(
+            type_and_space(&mut session, "shizheyang").as_deref(),
+            Some("是这样")
+        );
+        for c in "ma".chars() {
+            session.key(&Key::char(c));
+        }
+        assert_eq!(session.candidates()[0].text, "吗", "链还在：重放");
+
+        // 对账发现前文里「是这样」没了：链清空，候选重算成普通解码（首选回到「马」）
+        session.reconcile_prefix("别的话");
+        assert!(session.prefix().is_empty());
+        assert_eq!(session.candidates()[0].text, "马");
+
+        // 对得上就不重算：候选列表不变（同一个列表还是重放那一份）
+        let engine = reconcile_engine();
+        let mut session = Session::with_engine(&engine);
+        type_and_space(&mut session, "shizheyang");
+        for c in "ma".chars() {
+            session.key(&Key::char(c));
+        }
+        let replayed = session.candidates().to_vec();
+        session.reconcile_prefix("前缀是这样");
+        assert_eq!(session.candidates(), replayed.as_slice());
     }
 
     #[test]

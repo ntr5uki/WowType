@@ -16,7 +16,7 @@
  * 删函数或改参数含义时升主版本。外壳启动时用 wowtype_abi_version() 比对主版本。
  * 规则见 docs/ABI.md。 */
 #define WOWTYPE_ABI_VERSION_MAJOR 1
-#define WOWTYPE_ABI_VERSION_MINOR 10
+#define WOWTYPE_ABI_VERSION_MINOR 11
 
 #ifdef __cplusplus
 extern "C" {
@@ -416,6 +416,12 @@ const WowtypeFrame *wowtype_session_key(WowtypeSession *session, const WowtypeKe
  * 一样。返回 0 成功，-1 session 为 NULL。
  * 不要在每次上屏后调（如 _reset 那条路）：那样每次选词都会清空，重放等于没用。 */
 int wowtype_session_clear_prefix(WowtypeSession *session);
+/* 拿应用上报的「光标前文本」对账（1.11 起）：链上各条的 text 拼起来和它求最长公共后缀，只保留
+ * 对得上的最后几条（整个词对得上才算）；一条都对不上就清空。text_before_cursor 是光标前真实的
+ * 那一段（UTF-8，0 结尾），只传光标前的部分；注意 fcitx5 的 surroundingText cursor() 是**字符**
+ * 偏移，外壳要换算成字节再传。拿不到前文的应用（终端、WPS）不要调，传空串会清空整条链。
+ * 返回 0 成功（链本来是空的也算成功），-1 session 或 text 为 NULL。 */
+int wowtype_session_reconcile_prefix(WowtypeSession *session, const char *text_before_cursor);
 /* 清空编辑区；commit_pending 非 0 时，已选的词 + 原始输入放进 frame->commit（切换输入法、
  * 打字途中切英文时，和回车一样），原始输入也记一次选词。 */
 const WowtypeFrame *wowtype_session_reset(WowtypeSession *session, int commit_pending);

@@ -269,6 +269,9 @@ int main(int argc, char **argv) {
         check(wowtype_session_candidate_total(s) == 0, "session: engine unset");
         check(wowtype_session_clear_prefix(s) == 0, "session: clear prefix");
         check(wowtype_session_clear_prefix(NULL) != 0, "session: clear prefix without a session");
+        check(wowtype_session_reconcile_prefix(s, "") == 0, "session: reconcile prefix");
+        check(wowtype_session_reconcile_prefix(s, NULL) != 0, "session: reconcile without text");
+        check(wowtype_session_reconcile_prefix(NULL, "") != 0, "session: reconcile without a session");
         wowtype_session_free(s);
     }
 

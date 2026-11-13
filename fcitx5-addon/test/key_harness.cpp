@@ -243,6 +243,52 @@ void runCases(Instance &instance) {
           "标点上屏清空前缀链：ma 的候选是普通解码（" + std::to_string(plain.size()) + " 条 / 重放 " +
               std::to_string(replayed.size()) + " 条），实际 " + join(plain));
 
+    // 前缀链对账（ABI 1.11）：应用上报光标前文本时校验链。setText 的 cursor / anchor 是
+    // **字符**偏移（和真实前端上报的一样），不是字节
+    {
+        // 光标前是「前缀中文abc是这样」（10 字符 / 24 字节）：链对得上，照样重放。
+        // 要是把 cursor 当字节用，这里会切在半个汉字上、对不上，链就没了
+        fresh(ic.get());
+        type(ic.get(), "shizheyang<sp>");
+        ic->surroundingText().setText("前缀中文abc是这样", 10, 10);
+        type(ic.get(), "ma");
+        const auto kept = page(ic.get());
+        check(kept.size() == 1 && !kept.empty() && kept[0] == "吗",
+              "对账·前文和链一致：光标在末尾，照样重放（候选 " + std::to_string(kept.size()) +
+                  " 条），实际 " + join(kept));
+
+        // 用户把「是这样」删成「是这」：对不上，链整条丢掉，候选回到普通解码
+        fresh(ic.get());
+        type(ic.get(), "shizheyang<sp>");
+        ic->surroundingText().setText("前缀中文abc是这", 9, 9);
+        type(ic.get(), "ma");
+        const auto dropped = page(ic.get());
+        check(dropped.size() > 1,
+              "对账·前文少了字：链条丢掉（候选回到普通解码 " + std::to_string(dropped.size()) +
+                  " 条），实际 " + join(dropped));
+
+        // 有选区（anchor 在光标左边）：选区会被下一次输入替换，按选区左边那段算，链压着就截断
+        fresh(ic.get());
+        type(ic.get(), "shizheyang<sp>");
+        ic->surroundingText().setText("前缀中文abc是这样", 10, 7);
+        type(ic.get(), "ma");
+        const auto selected = page(ic.get());
+        check(selected.size() > 1,
+              "对账·选区压着链：链截断（候选回到普通解码 " + std::to_string(selected.size()) +
+                  " 条），实际 " + join(selected));
+
+        // 拿不到前文（终端、WPS 这类应用）：什么都不做，链保持原样，照样重放
+        fresh(ic.get());
+        type(ic.get(), "shizheyang<sp>");
+        ic->surroundingText().invalidate();
+        type(ic.get(), "ma");
+        const auto invalid = page(ic.get());
+        check(invalid.size() == 1 && !invalid.empty() && invalid[0] == "吗",
+              "对账·拿不到前文：不动链，照样重放（候选 " + std::to_string(invalid.size()) +
+                  " 条），实际 " + join(invalid));
+        ic->surroundingText().invalidate();
+    }
+
     // 数字后的句点是小数点（#50）：数字原样交给应用，句点也原样
     fresh(ic.get());
     type(ic.get(), "3.14");

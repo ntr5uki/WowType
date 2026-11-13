@@ -523,6 +523,27 @@ pub unsafe extern "C" fn wowtype_session_clear_prefix(session: *mut WowtypeSessi
     0
 }
 
+/// 拿应用上报的「光标前文本」对账（1.11 起）：链尾部文字和它求最长公共后缀，只保留对得上的
+/// 最后几条；一条都对不上就清空整条链。text_before_cursor 是光标前**真实**的那一段（UTF-8），
+/// 拿不到前文的应用（终端、WPS）不要调，传空串会把链清掉。
+/// 返回 0 成功（包括链本来是空的），-1 session 或 text 为 NULL。
+#[no_mangle]
+pub unsafe extern "C" fn wowtype_session_reconcile_prefix(
+    session: *mut WowtypeSession,
+    text_before_cursor: *const c_char,
+) -> c_int {
+    let (Some(handle), false) = (unsafe { session.as_mut() }, text_before_cursor.is_null()) else {
+        return -1;
+    };
+    let text = unsafe { arg(text_before_cursor) };
+    let inner = &mut handle.session;
+    if panic::catch_unwind(panic::AssertUnwindSafe(|| inner.reconcile_prefix(&text))).is_err() {
+        set_last_error("session reconcile_prefix panicked");
+        return -1;
+    }
+    0
+}
+
 // ---- 过渡函数：外壳还没挪完时用，挪完以后删掉（见 docs/ABI.md）----
 
 /// 全部原始输入（含已选词用掉的部分）。
@@ -725,6 +746,20 @@ mod tests {
     #[test]
     fn null_handles() {
         assert_eq!(unsafe { wowtype_session_clear_prefix(ptr::null_mut()) }, -1);
+        assert_eq!(
+            unsafe { wowtype_session_reconcile_prefix(ptr::null_mut(), ptr::null()) },
+            -1
+        );
+        let session = unsafe { wowtype_session_new(ptr::null_mut(), ptr::null()) };
+        assert_eq!(
+            unsafe { wowtype_session_reconcile_prefix(session, ptr::null()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { wowtype_session_reconcile_prefix(session, b"\0".as_ptr().cast()) },
+            0
+        );
+        unsafe { wowtype_session_free(session) };
         assert!(unsafe { wowtype_session_key(ptr::null_mut(), ptr::null()) }.is_null());
         assert!(unsafe { wowtype_session_reset(ptr::null_mut(), 0) }.is_null());
         assert_eq!(

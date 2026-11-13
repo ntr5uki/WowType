@@ -424,8 +424,9 @@ private:
     /// 把引擎、上文、设置同步给会话（引擎是后台载入的，设置可能刚改过）。
     void syncSession(WowtypeState *state);
     /// 同步后交给会话处理一个按下的键；action 是 WOWTYPE_KEY_ACTION_*（fcitx5 全局的翻页、
-    /// 移动候选热键）。返回会话的 frame（会话没建好时为 NULL）。
-    const WowtypeFrame *sessionKey(WowtypeState *state, const fcitx::Key &key,
+    /// 移动候选热键）。交之前先用应用的前文对一次前缀链。返回会话的 frame（会话没建好时为 NULL）。
+    const WowtypeFrame *sessionKey(fcitx::InputContext *ic, WowtypeState *state,
+                                   const fcitx::Key &key,
                                    uint32_t action = WOWTYPE_KEY_ACTION_NONE);
     /// 这个键对应的 fcitx5 全局翻页、移动候选热键（方向键不算，照横排竖排的规则走）。
     uint32_t keyAction(const fcitx::Key &key) const;
@@ -450,6 +451,9 @@ private:
     /// 前缀链（上屏过的词 + 拼音，算候选时重放用）断掉：光标前的内容不是拼音打出来的
     /// （标点、符号、工具栏插入、表情、译文、应用侧删字、取消输入、换输入框）时调。
     void clearPrefix(fcitx::InputContext *ic);
+    /// 拿应用上报的光标前文本校验前缀链（用户删了字、挪了光标、在别处改了字）。
+    /// 拿不到前文（surrounding text 无效）时什么也不做；只在没在打字时调（见 sessionKey）。
+    void reconcilePrefix(fcitx::InputContext *ic);
     /// 选中光标所在的候选；没有候选时上屏原始输入（交给会话按一次空格）。
     void commitCurrent(fcitx::InputContext *ic, WowtypeState *state);
     void rememberContext(const std::string &text);
