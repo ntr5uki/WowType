@@ -11,6 +11,8 @@
 //!   编辑区的分音节显示（`nihao` 显示成 `ni hao`，双拼显示成全拼）。
 //!
 //! - 选词（句首词进已选栈，整句上屏）和学习（选词记录、分几次选出来的整句也记一次）；
+//! - 前缀链：上屏过的词和拼音记在会话里，第 2 步重放成「拼音前缀 + 当前输入」用
+//!   （分段输入的候选排序要和一口气打一样）；现在只记不读。
 //! - 空格、回车、数字、分号引号选词、计算器和双拼分号进编辑区，翻页、移光标和
 //!   横排下键展开的候选面板（页和光标照 fcitx5 的候选列表：各管各的，光标可以不在这一页上）。
 //!
@@ -186,6 +188,18 @@ pub struct Selection {
     pub bytes: usize,
 }
 
+/// 前缀链里的一条：上屏过的一个词（或整句）和它的拼音。
+///
+/// 前缀链是「已经上屏、还能拼回拼音」的那一段，第 2 步拿它重放成「拼音前缀 + 当前输入」，
+/// 让分段输入的候选排序和一口气打一样（见设计文档「上下文断链」：链上只有追加和清空）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Committed {
+    /// 拼音，空格分音节（和 [`Candidate::pinyin`] 一样）。
+    pub pinyin: String,
+    /// 上屏的文字：重放以后要从候选里剥掉，不显示在编辑区。
+    pub text: String,
+}
+
 /// 一次调用之后外壳要做的事。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
@@ -342,6 +356,9 @@ pub type Clock = fn() -> Option<LocalTime>;
 
 /// 选了开头的词以后，拿已上屏的字 + 已选的词当上文，最多这么多字节。
 const CONTEXT_BYTES: usize = 24;
+/// 前缀链最多留多少个音节（16 个音节大约八个汉字，和 [`CONTEXT_BYTES`] 的上文差不多长；
+/// 再长重放串只在拖慢重算，早期打错的音节反而一直跟着）。
+const PREFIX_SYLLABLES: usize = 16;
 /// emoji 推荐插在第几个（首选和次选后面）。
 const EMOJI_SLOT: usize = 2;
 
@@ -357,6 +374,9 @@ pub struct Session<'e> {
     config: Config,
     /// 光标前已经上屏的字（外壳记的）。
     context: String,
+    /// 前缀链：上屏过的词和拼音，第 2 步重放成连续输入用。只有「追加」和「清空」，
+    /// 没有拼音的上屏（标点、数字、计算器、emoji、回车上的原始字母）清空整条。
+    prefix: Vec<Committed>,
     clock: Clock,
     /// 候选缓存：输入、已选词、引擎、上文、设置变了就作废，用的时候再算。
     candidates: Vec<Candidate>,
@@ -384,6 +404,7 @@ impl Default for Session<'_> {
             engine: None,
             config: Config::default(),
             context: String::new(),
+            prefix: Vec::new(),
             clock: system_time,
             candidates: Vec::new(),
             fresh: false,
@@ -454,6 +475,16 @@ impl<'e> Session<'e> {
             self.context.push_str(text);
             self.fresh = false;
         }
+    }
+
+    /// 前缀链：已经上屏、还拼得出拼音的那些词（第 2 步重放用）。
+    pub fn prefix(&self) -> &[Committed] {
+        &self.prefix
+    }
+
+    /// 清空前缀链（换输入框、光标被挪走、应用侧删字；第 2 步接上外壳的这些信号）。
+    pub fn clear_prefix(&mut self) {
+        self.prefix.clear();
     }
 
     /// 换掉读本地时间的函数（测试用）。
@@ -880,6 +911,8 @@ impl<'e> Session<'e> {
             });
         } else {
             let text = self.selected_text() + &pick.to_string();
+            // 取出来的这个字带上读音才拼得进重放串，对不上就断链（和本来的学习一致）
+            self.record_prefix(&pick.to_string(), &pinyin);
             self.finish(text);
         }
         true
@@ -1191,11 +1224,15 @@ impl<'e> Session<'e> {
         match chosen.kind {
             CandidateKind::Emoji => {
                 let text = self.selected_text() + &chosen.commit;
+                // emoji 没有拼音，拼不进重放串
+                self.prefix.clear();
                 self.finish(text);
                 self.last_choice = Some(chosen);
             }
             CandidateKind::Plain if chosen.consumed >= remaining => {
                 let text = self.selected_text() + &chosen.text;
+                // 计算结果、日期时间这类没有拼音，拼不进重放串
+                self.prefix.clear();
                 self.finish(text);
                 self.last_choice = Some(chosen);
             }
@@ -1231,6 +1268,7 @@ impl<'e> Session<'e> {
     /// 已选的词 + tail 上屏，记选词，清空。
     fn commit_with(&mut self, tail: &str, tail_pinyin: &str) {
         let text = self.selected_text() + tail;
+        self.record_prefix(tail, tail_pinyin);
         if self.engine.is_some() && !text.is_empty() {
             if !tail.is_empty() {
                 // 带上拼音：选够次数后引擎会自动把这个词收进用户词库
@@ -1254,6 +1292,61 @@ impl<'e> Session<'e> {
             }
         }
         self.finish(text);
+    }
+
+    /// 把这次上屏记进前缀链：有拼音的追加一条（已选的词和 tail 算一条，
+    /// 分几次选出来的整句也能整个重放）；没有拼音的（标点、数字、计算器、emoji、
+    /// 回车上的原始字母）清空整条链——重放靠拼音，拼不进重放串的，前面的也一起丢掉。
+    fn record_prefix(&mut self, tail: &str, tail_pinyin: &str) {
+        let text = self.selected_text() + tail;
+        if text.is_empty() {
+            return;
+        }
+        // 最后这一段的拼音是重放串的结尾，没有它就是没有拼音的上屏
+        let pinyin = if tail_pinyin.is_empty() {
+            String::new()
+        } else {
+            self.committed_pinyin(tail_pinyin).unwrap_or_default()
+        };
+        if pinyin.is_empty() {
+            self.prefix.clear();
+            return;
+        }
+        self.prefix.push(Committed { pinyin, text });
+        self.trim_prefix();
+    }
+
+    /// 这次上屏（已选的词 + tail）的拼音；已选的词里有任何一段没有拼音就是 None。
+    fn committed_pinyin(&self, tail_pinyin: &str) -> Option<String> {
+        let mut pinyin = String::new();
+        for selection in &self.selections {
+            // 以词定字取出来的字对不上读音时拼音是空的
+            if selection.pinyin.is_empty() {
+                return None;
+            }
+            if !pinyin.is_empty() {
+                pinyin.push(' ');
+            }
+            pinyin.push_str(&selection.pinyin);
+        }
+        if !pinyin.is_empty() && !tail_pinyin.is_empty() {
+            pinyin.push(' ');
+        }
+        pinyin.push_str(tail_pinyin);
+        Some(pinyin)
+    }
+
+    /// 链长上限：音节最多的丢掉最老的几条，直到不超过 [`PREFIX_SYLLABLES`]。
+    fn trim_prefix(&mut self) {
+        let syllables = |prefix: &[Committed]| -> usize {
+            prefix
+                .iter()
+                .map(|c| c.pinyin.split_whitespace().count())
+                .sum()
+        };
+        while syllables(&self.prefix) > PREFIX_SYLLABLES {
+            self.prefix.remove(0);
+        }
     }
 
     /// 记一次选词。上文和算候选时一样（已上屏的字 + 已选的词）。
@@ -1392,6 +1485,10 @@ pub fn system_time() -> Option<LocalTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lexicon::MemoryLexicon;
+    use crate::lm::BigramLm;
+    use crate::{LanguageModel, Lexicon};
+    use std::sync::Arc;
 
     fn typed(keys: &str) -> Session<'static> {
         let mut session = Session::new();
@@ -1399,6 +1496,27 @@ mod tests {
             session.key(&Key::char(c));
         }
         session
+    }
+
+    fn test_engine() -> Engine {
+        let lexicon: Arc<dyn Lexicon> = Arc::new(
+            MemoryLexicon::from_tsv_str(concat!(
+                "shi zhe yang\t是这样\t8000\n",
+                "ma\t吗\t900\n",
+                "ma\t马\t800\n",
+            ))
+            .unwrap(),
+        );
+        let lm: Arc<dyn LanguageModel> = Arc::new(BigramLm::default());
+        Engine::new(lexicon, lm)
+    }
+
+    /// 打字，然后空格选首选。
+    fn type_and_space(session: &mut Session, keys: &str) -> Option<String> {
+        for c in keys.chars() {
+            session.key(&Key::char(c));
+        }
+        session.key(&Key::press(keysym::SPACE)).commit
     }
 
     #[test]
@@ -1461,5 +1579,71 @@ mod tests {
         let frame = session.frame(true);
         assert_eq!(frame.preedit, "你好ma");
         assert_eq!(frame.preedit_cursor, "你好ma".len());
+    }
+
+    #[test]
+    fn prefix_appends_committed_words() {
+        let engine = test_engine();
+        let mut session = Session::with_engine(&engine);
+        assert!(session.prefix().is_empty());
+
+        let committed = type_and_space(&mut session, "shizheyang");
+        assert_eq!(committed.as_deref(), Some("是这样"));
+        assert_eq!(
+            session.prefix(),
+            &[Committed {
+                pinyin: "shi zhe yang".into(),
+                text: "是这样".into(),
+            }]
+        );
+
+        let committed = type_and_space(&mut session, "ma").unwrap();
+        assert_eq!(session.prefix().len(), 2);
+        assert_eq!(session.prefix()[1].pinyin, "ma");
+        assert_eq!(session.prefix()[1].text, committed);
+    }
+
+    #[test]
+    fn prefix_clears_on_commit_without_pinyin() {
+        let engine = test_engine();
+        let mut session = Session::with_engine(&engine);
+        type_and_space(&mut session, "shizheyang");
+        type_and_space(&mut session, "ma");
+        assert_eq!(session.prefix().len(), 2);
+
+        // 计算结果没有拼音：拼不进重放串，整条链清空
+        let committed = type_and_space(&mut session, "v1+1").unwrap();
+        assert!(committed.contains('2'), "{committed}");
+        assert!(session.prefix().is_empty());
+
+        // 回车把原始字母上屏，也没有拼音
+        type_and_space(&mut session, "shizheyang");
+        assert_eq!(session.prefix().len(), 1);
+        for c in "ma".chars() {
+            session.key(&Key::char(c));
+        }
+        assert_eq!(
+            session.key(&Key::press(keysym::RETURN)).commit.as_deref(),
+            Some("ma")
+        );
+        assert!(session.prefix().is_empty());
+    }
+
+    #[test]
+    fn prefix_drops_oldest_over_the_limit() {
+        let mut session = Session::new();
+        // 一条三个音节，六条就是十八个：超过上限以后最老的那条被丢掉
+        for i in 0..6 {
+            session.commit_with(&format!("词{i}"), "ma ma ma");
+        }
+        let syllables: usize = session
+            .prefix()
+            .iter()
+            .map(|c| c.pinyin.split_whitespace().count())
+            .sum();
+        assert!(syllables <= PREFIX_SYLLABLES, "{syllables}");
+        assert_eq!(session.prefix().len(), 5);
+        assert_eq!(session.prefix()[0].text, "词1");
+        assert_eq!(session.prefix()[4].text, "词5");
     }
 }
